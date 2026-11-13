@@ -1,0 +1,14 @@
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.csv
+*.wav
+*.iq
+*.pcm
+*.dis
+*.key
+*.pem
+.env
+.env.*

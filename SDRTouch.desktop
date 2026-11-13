@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SDR Touch
+Comment=Odbiornik i skaner SDRplay
+Exec=/home/piasek/sdr-touch/build/sdr-touch
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;HamRadio;
