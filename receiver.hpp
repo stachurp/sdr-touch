@@ -7,6 +7,19 @@
 #include <atomic>
 #include <cstdint>
 
+struct FrontendSettings {
+    bool agc = true;
+    int rfReduction = 0;
+    int ifReduction = 50;
+    int agcSetpoint = -30;
+    double ppm = 0;
+    bool operator==(const FrontendSettings &other) const {
+        return agc == other.agc && rfReduction == other.rfReduction &&
+               ifReduction == other.ifReduction && agcSetpoint == other.agcSetpoint && ppm == other.ppm;
+    }
+    bool operator!=(const FrontendSettings &other) const { return !(*this == other); }
+};
+
 struct ReceiverSettings {
     std::int64_t frequency = 7100000;
     Mode mode = Mode::LSB;
@@ -16,6 +29,7 @@ struct ReceiverSettings {
     std::int64_t scanStep = 1000;
     double threshold = -60;
     quint64 scanId = 0;
+    FrontendSettings frontend;
 };
 
 class Receiver : public QThread {
@@ -36,6 +50,7 @@ signals:
     void detected(quint64 scanId, qint64 frequency, double dbfs, const QString &mode);
     void scanFinished(quint64 scanId);
     void blockReceived();
+    void frontendApplied();
 
 protected:
     void run() override;

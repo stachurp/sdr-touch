@@ -6,7 +6,22 @@ a do dekodowania i informacji o krajach także z pakietów `wsjtx`, `iso-codes` 
 
 ## Uruchomienie
 
-Z menu pulpitu wybierz **SDR Touch**. Aby uruchomić program przez SSH na podłączonym ekranie
+Na tej instalacji uruchom **SDR Touch** ikoną na pulpicie lub z menu aplikacji.
+Jeśli skrótu na pulpicie brakuje, można go odtworzyć:
+
+```sh
+desktop="$(xdg-user-dir DESKTOP)"
+if [ -e "$desktop/SDRTouch.desktop" ]; then
+  echo "Skrót już istnieje; nie został zastąpiony."
+else
+  install -m 755 ~/sdr-touch/SDRTouch.desktop "$desktop/SDRTouch.desktop"
+fi
+```
+
+Plik skrótu wskazuje `/home/piasek/sdr-touch/build/sdr-touch`; przy innym użytkowniku
+trzeba dostosować pole `Exec`.
+
+Aby uruchomić program przez SSH na podłączonym ekranie
 przy obecnej konfiguracji sesji użytkownika `piasek`, wykonaj:
 
 ```sh
@@ -23,13 +38,25 @@ WFM ma 50 µs de-emfazy, jest monofoniczne i nie dekoduje RDS.
 
 Na ekranie **Odbiornik** przycisk **Wycisz** wyłącza tylko dźwięk głośnika; ponowne
 naciśnięcie przywraca ustawioną głośność. Odbiór, wskaźnik poziomu i dekoder nadal działają.
+Po ponownym uruchomieniu przywracane są ostatnia częstotliwość, modulacja, wybrany dekoder,
+głośność i stan wyciszenia. Są zapisywane lokalnie; ADS-B nie uruchamia się automatycznie.
 Wskaźnik pokazuje szczyt FFT w paśmie odbioru, a nie potwierdzenie obecności transmisji FT8.
 Wybierz zapisaną listę i częstotliwość lub użyj przycisków ◀ / ▶, aby przełączać pozycje.
 Razem z częstotliwością ustawiana jest jej modulacja. Pozycja z inną modulacją niż wymagana
 przez aktywny dekoder (USB dla FT8/FT4/WSPR, NFM dla DMR/YSF) wyłącza dekoder.
 
 Dotknięcie edytowalnego pola tekstowego lub liczbowego otwiera klawiaturę ekranową.
+Pola liczbowe pokazują cyfry oraz potrzebne znaki, takie jak separator dziesiętny i minus.
 Wpis zatwierdza się przyciskiem **Gotowe** albo odrzuca przez **Anuluj**.
+
+W zakładce **Ustawienia SDR** można zmienić automatyczne AGC na ręczną regulację IF,
+ustawić stopień tłumienia RF (0–3 dla wykrywanego RSP1), tłumienie IF, poziom docelowy
+AGC i korekcję częstotliwości w ppm. **Zastosuj** wysyła ustawienia do odbiornika i je
+zapamiętuje; **Wartości domyślne** przygotowują poprzedni tryb AGC, ale wymagają jeszcze
+zatwierdzenia. Mniejsze tłumienie może poprawić słaby sygnał, ale też przesterować odbiornik.
+Korekcję ppm zmieniaj tylko po porównaniu ze znanym wzorcem. Ustawienia dotyczą odbiornika
+i skanera; zewnętrzny dekoder ADS-B korzysta z osobnego AGC. Zmiana wzmocnienia zmienia
+skalę wskazań dBFS, dlatego po jej zmianie może wymagać korekty także próg skanowania.
 
 ## Skanowanie i listy
 
@@ -39,8 +66,8 @@ Skan przebiega jednokrotnie, z oczekiwaniem 250 ms na krok (400 ms dla WFM) plus
 pomiarów i przestrajania. Jeden tuner oznacza,
 że odsłuch jest wstrzymany na czas skanowania. **Zatrzymaj skanowanie** przywraca odsłuch.
 
-Poziom to szczyt FFT w paśmie wybranego trybu, w przybliżonych dBFS, przy włączonym AGC
-sprzętowym. Nie jest kalibrowanym pomiarem dBm; próg należy dobrać do szumu i anteny.
+Poziom to szczyt FFT w paśmie wybranego trybu, w przybliżonych dBFS. Zależy od ustawień
+wzmocnienia i nie jest kalibrowanym pomiarem dBm; próg należy dobrać do szumu i anteny.
 Wynik wymaga przekroczenia progu i wyraźnego sygnału ponad tło w co najmniej dziewięciu z piętnastu
 kolejnych pomiarów. Skan WFM porównuje także poziom w kanale z sąsiednim tłem.
 Ogranicza to przypadkowy szum i pojedyncze impulsy, ale nie potwierdza transmisji:

@@ -19,6 +19,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QGridLayout>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -34,6 +35,7 @@
 #include <QSlider>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QSpinBox>
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QTemporaryDir>
@@ -101,8 +103,9 @@ public:
 
 class Window : public QWidget {
 public:
-    explicit Window(bool test = false, bool mute = false, QString adsbExecutable = {}, QString voiceExecutable = {})
-        : adsbExecutable_(std::move(adsbExecutable)) {
+    explicit Window(bool test = false, bool mute = false, QString adsbExecutable = {}, QString voiceExecutable = {},
+                    bool testSettings = false)
+        : adsbExecutable_(std::move(adsbExecutable)), persistSettings_(test ? testSettings : !mute) {
         setWindowTitle("SDR Touch – RSP1");
         resize(1024, 600);
         setStyleSheet("QPushButton { min-height: 36px; } "
@@ -118,10 +121,69 @@ public:
         auto *scanLayout = new QVBoxLayout(scanPage);
         auto *adsbPage = new QWidget;
         auto *adsbLayout = new QVBoxLayout(adsbPage);
+        auto *frontendPage = new QWidget;
+        auto *frontendLayout = new QVBoxLayout(frontendPage);
         pages_->addTab(home, "Odbiornik");
         pages_->addTab(scanPage, "Skanowanie i listy");
         pages_->addTab(adsbPage, "Samoloty ADS-B");
+        pages_->addTab(frontendPage, "Ustawienia SDR");
         root->addWidget(pages_, 1);
+        auto *frontendForm = new QFormLayout;
+        frontendAgc_ = new QComboBox;
+        frontendAgc_->addItem("Automatyczne AGC", true);
+        frontendAgc_->addItem("Ręczne IF", false);
+        frontendRf_ = new QSpinBox;
+        frontendRf_->setRange(0, 3);
+        frontendIf_ = new QSpinBox;
+        frontendIf_->setRange(20, 59);
+        frontendIf_->setSuffix(" dB");
+        frontendSetpoint_ = new QSpinBox;
+        frontendSetpoint_->setRange(-60, 0);
+        frontendSetpoint_->setSuffix(" dBFS");
+        frontendPpm_ = new QDoubleSpinBox;
+        frontendPpm_->setRange(-100, 100);
+        frontendPpm_->setDecimals(2);
+        frontendPpm_->setSingleStep(0.1);
+        frontendPpm_->setSuffix(" ppm");
+        frontendPpm_->setKeyboardTracking(false);
+        frontendForm->addRow("Sterowanie IF", frontendAgc_);
+        frontendForm->addRow("Tłumienie RF (LNA, 0–3)", frontendRf_);
+        frontendForm->addRow("Tłumienie IF", frontendIf_);
+        frontendForm->addRow("Poziom docelowy AGC", frontendSetpoint_);
+        frontendForm->addRow("Korekcja częstotliwości", frontendPpm_);
+        frontendLayout->addLayout(frontendForm);
+        auto *frontendNote = new QLabel(
+            "Mniejsze tłumienie RF/IF zwiększa wzmocnienie, ale może powodować przesterowanie. "
+            "Korekcję ppm ustawiaj tylko po sprawdzeniu wzorca. ADS-B używa osobnych ustawień.");
+        frontendNote->setWordWrap(true);
+        frontendLayout->addWidget(frontendNote);
+        auto *frontendButtons = new QHBoxLayout;
+        auto *frontendDefaults = new QPushButton("Wartości domyślne");
+        auto *frontendApply = new QPushButton("Zastosuj");
+        frontendDefaults->setObjectName("frontendDefaults");
+        frontendApply->setObjectName("frontendApply");
+        frontendButtons->addWidget(frontendDefaults);
+        frontendButtons->addWidget(frontendApply);
+        frontendLayout->addLayout(frontendButtons);
+        frontendStatus_ = new QLabel("Zmiany wymagają naciśnięcia „Zastosuj”.");
+        frontendStatus_->setWordWrap(true);
+        frontendLayout->addWidget(frontendStatus_);
+        frontendLayout->addStretch();
+        setFrontendWidgets(frontendSettings_);
+        connect(frontendAgc_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+            updateFrontendControls();
+        });
+        connect(frontendDefaults, &QPushButton::clicked, this, [this] {
+            setFrontendWidgets(FrontendSettings{});
+            frontendStatus_->setText("Wartości domyślne gotowe. Naciśnij „Zastosuj”.");
+        });
+        connect(frontendApply, &QPushButton::clicked, this, [this] {
+            frontendSettings_ = frontendWidgetValues();
+            applySettings();
+            scheduleReceiverSettings();
+            frontendStatus_->setText(adsb_ ? "Ustawienia zostaną użyte po wyłączeniu ADS-B." :
+                                            "Wysyłanie ustawień do odbiornika...");
+        });
         auto *grid = new QGridLayout;
         frequency_ = frequencyBox(7.1);
         mode_ = modeBox();
@@ -390,13 +452,47 @@ public:
         audioStatus_ = new QLabel;
         root->addWidget(status_);
         root->addWidget(audioStatus_);
+        settingsTimer_ = new QTimer(this);
+        settingsTimer_->setSingleShot(true);
+        settingsTimer_->setInterval(500);
+        connect(settingsTimer_, &QTimer::timeout, this, [this] { saveReceiverSettings(); });
+        const int restoredDigital = persistSettings_ ? restoreReceiverSettings() : 0;
         connect(closeButton, &QPushButton::clicked, this, &QWidget::close);
         connect(mute_, &QPushButton::toggled, this, [this](bool muted) {
             mute_->setText(muted ? "Włącz dźwięk" : "Wycisz");
             if (audio_) audio_->setVolume(muted || adsb_ ? 0 : volume_->value() / 100.0);
+            scheduleReceiverSettings();
         });
+        mute_->setText(mute_->isChecked() ? "Włącz dźwięk" : "Wycisz");
         connect(volume_, &QSlider::valueChanged, this, [this](int value) {
             if (audio_ && !mute_->isChecked() && !adsb_) audio_->setVolume(value / 100.0);
+            scheduleReceiverSettings();
+        });
+        connect(frequency_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] {
+            applySettings();
+            scheduleReceiverSettings();
+        });
+        connect(mode_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+            applySettings();
+            if (!digitalEnabled_ && digitalMode_->currentData().toInt() == int(DigitalMode::Off))
+                scheduleReceiverSettings();
+        });
+        connect(digitalMode_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, test] {
+            if (!digital_ && !test) return;
+            const bool enabled = digitalMode_->currentData().toInt() != int(DigitalMode::Off);
+            if (enabled && !digitalEnabled_) {
+                previousMode_ = mode_->currentIndex();
+            } else if (!enabled && digitalEnabled_) {
+                mode_->setCurrentIndex(previousMode_);
+            }
+            if (enabled) mode_->setCurrentIndex(mode_->findData(int(voiceMode() == VoiceMode::Off ? Mode::USB : Mode::NFM)));
+            digitalEnabled_ = enabled;
+            voiceMetadata_->setVisible(voiceMode() != VoiceMode::Off);
+            mode_->setEnabled(!enabled && !scanning_);
+            scanButton_->setEnabled(!enabled && receiver_ && receiver_->isRunning());
+            applySettings();
+            if (!adsb_) scheduleReceiverSettings();
+            if (enabled) pages_->setCurrentIndex(0);
         });
         setupAdsbPosition(test);
         setupLists(test);
@@ -406,6 +502,8 @@ public:
             savedQth_ = "KO02";
             digitalStatus_->setText("Oczekiwanie na początek pełnego przedziału UTC");
             addDigitalMessage({"120000", "CQ SP9ABC JO90", "SP9ABC", "JO90", -10, 14075500, DigitalMode::FT8});
+            digitalMode_->setCurrentIndex(restoredDigital);
+            restoringSettings_ = false;
             return;
         }
 
@@ -496,7 +594,7 @@ public:
                 }
             });
             audio_->setBufferSize(kAudioRate * 4 / 4);
-            audio_->setVolume(volume_->value() / 100.0);
+            audio_->setVolume(mute_->isChecked() ? 0 : volume_->value() / 100.0);
             audioDevice_ = audio_->start();
             if (!audioDevice_ || audio_->error() == QAudio::OpenError ||
                 audio_->error() == QAudio::IOError || audio_->error() == QAudio::FatalError) {
@@ -506,6 +604,9 @@ public:
                 audioStatus_->setText("Wyjście audio: " + device.deviceName());
         }
         receiver_ = new Receiver(dataFile(), this);
+        connect(receiver_, &Receiver::frontendApplied, this, [this] {
+            frontendStatus_->setText("Ustawienia przekazano do sterownika SDRplay.");
+        });
         connect(receiver_, &Receiver::statusChanged, status_, &QLabel::setText);
         connect(receiver_, &Receiver::blockReceived, this, [this] { if (!adsb_) receivedIq_ = true; });
         connect(receiver_, &Receiver::audioGap, this, [this] {
@@ -551,8 +652,6 @@ public:
         connect(receiver_, &Receiver::scanFinished, this, [this](quint64 scanId) {
             finishScan(scanId);
         });
-        connect(frequency_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] { applySettings(); });
-        connect(mode_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] { applySettings(); });
         connect(scanButton_, &QPushButton::clicked, this, [this] { toggleScan(); });
         connect(adsbStart_, &QPushButton::clicked, this, [this] { toggleAdsb(); });
         connect(saveQth, &QPushButton::clicked, this, [this] {
@@ -574,27 +673,17 @@ public:
             sortMessages();
             digitalStatus_->setText(locator.isEmpty() ? "Usunięto lokator QTH" : "Zapisano lokator QTH");
         });
-        connect(digitalMode_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
-            if (!digital_) return;
-            const bool enabled = digitalMode_->currentData().toInt() != int(DigitalMode::Off);
-            if (enabled && !digitalEnabled_) {
-                previousMode_ = mode_->currentIndex();
-            } else if (!enabled && digitalEnabled_) {
-                mode_->setCurrentIndex(previousMode_);
-            }
-            if (enabled) mode_->setCurrentIndex(mode_->findData(int(voiceMode() == VoiceMode::Off ? Mode::USB : Mode::NFM)));
-            digitalEnabled_ = enabled;
-            voiceMetadata_->setVisible(voiceMode() != VoiceMode::Off);
-            mode_->setEnabled(!enabled && !scanning_);
-            scanButton_->setEnabled(!enabled && receiver_->isRunning());
-            applySettings();
-            if (enabled) pages_->setCurrentIndex(0);
-        });
+        if (digital_) digitalMode_->setCurrentIndex(restoredDigital);
+        restoringSettings_ = false;
         applySettings();
         receiver_->start();
     }
 
     ~Window() override {
+        if (settingsTimer_ && settingsTimer_->isActive()) {
+            settingsTimer_->stop();
+            saveReceiverSettings();
+        }
         audioDevice_ = nullptr;
         if (clockTimer_) clockTimer_->stop();
         if (clock_) {
@@ -630,6 +719,75 @@ public:
     }
 
     bool smokeSucceeded() const { return receivedIq_ && audioDevice_ && audioBlocks_ > 10; }
+    void setPersistenceTestState() {
+        frequency_->setValue(438.775);
+        mode_->setCurrentIndex(mode_->findData(int(Mode::AM)));
+        digitalMode_->setCurrentIndex(digitalMode_->findData(voiceDmr));
+        mute_->setChecked(true);
+        savedDigitalMode_ = digitalMode_->currentIndex();
+        adsb_ = new AdsbDecoder(this);
+        digitalMode_->setCurrentIndex(0);
+        volume_->setValue(68);
+    }
+    bool persistenceDigitalRestored() const {
+        return std::llround(frequency_->value() * 1000000) == 438775000 &&
+            mode_->currentData().toInt() == int(Mode::NFM) &&
+            mode_->itemData(previousMode_).toInt() == int(Mode::AM) &&
+            digitalMode_->currentData().toInt() == voiceDmr &&
+            mute_->isChecked() && volume_->value() == 68 && settings().mode == Mode::DigitalVoice;
+    }
+    bool frontendPersistenceTestState() {
+        setFrontendWidgets({false, 3, 31, -42, -2.5});
+        if (settings().frontend != FrontendSettings{}) return false;
+        auto *apply = findChild<QPushButton *>("frontendApply");
+        if (!apply) return false;
+        apply->click();
+        return frontendRestored();
+    }
+    bool frontendRestored() const {
+        return settings().frontend == FrontendSettings{false, 3, 31, -42, -2.5} &&
+            frontendWidgetValues() == settings().frontend && frontendIf_->isEnabled() &&
+            !frontendSetpoint_->isEnabled();
+    }
+    bool frontendDefaultsRestored() const {
+        return settings().frontend.rfReduction == 0;
+    }
+    bool frontendResetTest() {
+        auto *defaults = findChild<QPushButton *>("frontendDefaults");
+        auto *apply = findChild<QPushButton *>("frontendApply");
+        if (!defaults || !apply) return false;
+        defaults->click();
+        if (settings().frontend != FrontendSettings{false, 3, 31, -42, -2.5} ||
+            frontendWidgetValues() != FrontendSettings{}) return false;
+        apply->click();
+        return settings().frontend == FrontendSettings{};
+    }
+    bool frontendAppliedAfterAdsb() const {
+        return frontendRestored() &&
+            frontendStatus_->text() == "Ustawienia przekazano do sterownika SDRplay.";
+    }
+    void showFrontendUi() { pages_->setCurrentIndex(3); }
+    bool persistenceLiveRestored() const {
+        return persistenceDigitalRestored() && receiver_ && receiver_->isRunning() && receivedIq_ &&
+            audio_ && audioDevice_ && audio_->volume() == 0;
+    }
+    void setPersistenceAnalogState() {
+        digitalMode_->setCurrentIndex(0);
+        frequency_->setValue(100.1);
+        mode_->setCurrentIndex(mode_->findData(int(Mode::WFM)));
+        volume_->setValue(0);
+        mute_->setChecked(false);
+    }
+    bool persistenceAnalogRestored() const {
+        return std::llround(frequency_->value() * 1000000) == 100100000 &&
+            mode_->currentData().toInt() == int(Mode::WFM) &&
+            digitalMode_->currentData().toInt() == int(DigitalMode::Off) &&
+            !mute_->isChecked() && volume_->value() == 0;
+    }
+    bool persistenceDefaultsRestored() const {
+        return std::llround(frequency_->value() * 1000000) == 7100000 &&
+            digitalMode_->currentData().toInt() == int(DigitalMode::Off);
+    }
     void startVoiceSmoke(VoiceMode mode) {
         voiceInputBlocks_ = 0;
         mute_->setChecked(true);
@@ -1226,7 +1384,28 @@ private:
         s.scanStep = std::llround(step_->value() * 1000);
         s.threshold = threshold_->value();
         s.scanId = scanId_;
+        s.frontend = frontendSettings_;
         return s;
+    }
+
+    void updateFrontendControls() {
+        const bool agc = frontendAgc_->currentData().toBool();
+        frontendIf_->setEnabled(!agc);
+        frontendSetpoint_->setEnabled(agc);
+    }
+
+    FrontendSettings frontendWidgetValues() const {
+        return {frontendAgc_->currentData().toBool(), frontendRf_->value(), frontendIf_->value(),
+                frontendSetpoint_->value(), frontendPpm_->value()};
+    }
+
+    void setFrontendWidgets(const FrontendSettings &f) {
+        frontendAgc_->setCurrentIndex(f.agc ? 0 : 1);
+        frontendRf_->setValue(f.rfReduction);
+        frontendIf_->setValue(f.ifReduction);
+        frontendSetpoint_->setValue(f.agcSetpoint);
+        frontendPpm_->setValue(f.ppm);
+        updateFrontendControls();
     }
 
     void applySettings() {
@@ -1253,6 +1432,127 @@ private:
     VoiceMode voiceMode() const {
         const int mode = digitalMode_->currentData().toInt();
         return mode == voiceDmr ? VoiceMode::DMR : mode == voiceYsf ? VoiceMode::YSF : VoiceMode::Off;
+    }
+
+    QString decoderKey(int index) const {
+        const QVariant data = digitalMode_->itemData(index);
+        if (!data.isValid()) return {};
+        const int value = data.toInt();
+        if (value == int(DigitalMode::Off)) return "OFF";
+        if (value == voiceDmr) return "DMR";
+        if (value == voiceYsf) return "YSF";
+        if (value == int(DigitalMode::FT8)) return "FT8";
+        if (value == int(DigitalMode::FT4)) return "FT4";
+        if (value == int(DigitalMode::WSPR)) return "WSPR";
+        return {};
+    }
+
+    int restoreReceiverSettings() {
+        QSettings settings;
+        settings.sync();
+        QStringList invalid;
+        if (settings.status() != QSettings::NoError)
+            invalid << "nie można odczytać pliku ustawień";
+        settings.beginGroup("receiver");
+        if (settings.contains("frequencyHz")) {
+            bool ok = false;
+            const qint64 hz = settings.value("frequencyHz").toLongLong(&ok);
+            if (ok && hz >= std::llround(frequency_->minimum() * 1000000) &&
+                hz <= std::llround(frequency_->maximum() * 1000000))
+                frequency_->setValue(hz / 1000000.0);
+            else invalid << "częstotliwość";
+        }
+        if (settings.contains("mode")) {
+            const QString value = settings.value("mode").toString();
+            const int index = mode_->findText(value == "WFM" ? "WFM mono" : value);
+            if (index >= 0) mode_->setCurrentIndex(index);
+            else invalid << "modulacja";
+        }
+        if (settings.contains("volume")) {
+            bool ok = false;
+            const int value = settings.value("volume").toInt(&ok);
+            if (ok && value >= 0 && value <= 100) volume_->setValue(value);
+            else invalid << "głośność";
+        }
+        if (settings.contains("muted")) {
+            const QString value = settings.value("muted").toString().toLower();
+            if (value == "true" || value == "1") mute_->setChecked(true);
+            else if (value == "false" || value == "0") mute_->setChecked(false);
+            else invalid << "wyciszenie";
+        }
+        if (settings.contains("sdrAgc")) {
+            const QString value = settings.value("sdrAgc").toString().toLower();
+            if (value == "true" || value == "1") frontendSettings_.agc = true;
+            else if (value == "false" || value == "0") frontendSettings_.agc = false;
+            else invalid << "AGC SDRplay";
+        }
+        const auto restoreInt = [&](const char *key, int &target, int minimum, int maximum, const QString &name) {
+            if (!settings.contains(key)) return;
+            bool ok = false;
+            const int value = settings.value(key).toInt(&ok);
+            if (ok && value >= minimum && value <= maximum) target = value;
+            else invalid << name;
+        };
+        restoreInt("sdrRfReduction", frontendSettings_.rfReduction, 0, 3, "tłumienie RF");
+        restoreInt("sdrIfReduction", frontendSettings_.ifReduction, 20, 59, "tłumienie IF");
+        restoreInt("sdrAgcSetpoint", frontendSettings_.agcSetpoint, -60, 0, "poziom AGC");
+        if (settings.contains("sdrPpm")) {
+            bool ok = false;
+            const double value = settings.value("sdrPpm").toDouble(&ok);
+            if (ok && std::isfinite(value) && std::abs(value) <= 100 &&
+                std::abs(value * 100 - std::round(value * 100)) < 0.00001)
+                frontendSettings_.ppm = value;
+            else invalid << "korekcja ppm";
+        }
+        setFrontendWidgets(frontendSettings_);
+        int decoder = 0;
+        if (settings.contains("decoder")) {
+            const QString value = settings.value("decoder").toString();
+            decoder = -1;
+            for (int i = 0; i < digitalMode_->count(); ++i)
+                if (decoderKey(i) == value) { decoder = i; break; }
+            if (decoder < 0) {
+                invalid << "dekoder";
+                decoder = 0;
+            }
+        }
+        settings.endGroup();
+        if (!invalid.isEmpty())
+            QMessageBox::warning(this, "Ustawienia odbiornika",
+                                 "Nie można przywrócić: " + invalid.join(", ") + ". Użyto wartości domyślnych.");
+        return decoder;
+    }
+
+    void scheduleReceiverSettings() {
+        if (persistSettings_ && !restoringSettings_) settingsTimer_->start();
+    }
+
+    void saveReceiverSettings() {
+        if (!persistSettings_) return;
+        const int decoder = adsb_ ? savedDigitalMode_ : digitalMode_->currentIndex();
+        const QString key = decoderKey(decoder);
+        const int analog = key == "OFF" ? mode_->currentIndex() : previousMode_;
+        if (key.isEmpty() || !mode_->itemData(analog).isValid()) {
+            QMessageBox::warning(this, "Ustawienia odbiornika",
+                                 "Nie udało się zapisać ustawień: nieprawidłowy tryb odbiornika.");
+            return;
+        }
+        QSettings settings;
+        settings.beginGroup("receiver");
+        settings.setValue("frequencyHz", std::llround(frequency_->value() * 1000000));
+        settings.setValue("mode", storedMode(Mode(mode_->itemData(analog).toInt())));
+        settings.setValue("decoder", key);
+        settings.setValue("volume", volume_->value());
+        settings.setValue("muted", mute_->isChecked());
+        settings.setValue("sdrAgc", frontendSettings_.agc);
+        settings.setValue("sdrRfReduction", frontendSettings_.rfReduction);
+        settings.setValue("sdrIfReduction", frontendSettings_.ifReduction);
+        settings.setValue("sdrAgcSetpoint", frontendSettings_.agcSetpoint);
+        settings.setValue("sdrPpm", frontendSettings_.ppm);
+        settings.endGroup();
+        settings.sync();
+        if (settings.status() != QSettings::NoError)
+            QMessageBox::warning(this, "Ustawienia odbiornika", "Nie udało się zapisać ustawień odbiornika.");
     }
 
     void playAudio(const QByteArray &pcm) {
@@ -1434,6 +1734,11 @@ private:
     QIODevice *audioDevice_ = nullptr;
     QDoubleSpinBox *frequency_, *start_, *end_, *step_, *threshold_, *manualFrequency_;
     QComboBox *mode_, *scanMode_, *manualMode_, *mainList_, *editList_, *stationChoice_;
+    QComboBox *frontendAgc_;
+    QSpinBox *frontendRf_, *frontendIf_, *frontendSetpoint_;
+    QDoubleSpinBox *frontendPpm_;
+    QLabel *frontendStatus_;
+    FrontendSettings frontendSettings_;
     QSlider *volume_;
     QProgressBar *meter_;
     QLabel *signal_, *status_, *audioStatus_;
@@ -1456,6 +1761,7 @@ private:
     DigitalDecoder *digital_ = nullptr;
     VoiceDecoder *voice_ = nullptr;
     QTimer *voiceAudioTimer_ = nullptr;
+    QTimer *settingsTimer_ = nullptr;
     QByteArray voiceAudio_;
     VoiceMode appliedVoice_ = VoiceMode::Off;
     qint64 voiceFrequency_ = 0;
@@ -1468,6 +1774,8 @@ private:
     std::unique_ptr<QTemporaryDir> testListsDirectory_;
     std::unique_ptr<StationLists> lists_;
     bool digitalEnabled_ = false;
+    bool persistSettings_ = false;
+    bool restoringSettings_ = true;
     bool digitalComplete_ = false;
     bool invalidQth_ = false;
     QString savedQth_;
@@ -1487,6 +1795,91 @@ private:
     int audioDrops_ = 0;
     int voiceInputBlocks_ = 0;
 };
+
+int receiverSettingsTest() {
+    QTemporaryDir directory;
+    if (!directory.isValid()) return 1;
+    QCoreApplication::setOrganizationName("SDRTouchSettingsTest");
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, directory.path());
+    {
+        QSettings settings;
+        settings.setValue("qth", "KO02");
+        settings.sync();
+        if (settings.status() != QSettings::NoError) return 1;
+    }
+    {
+        Window window(true, false, {}, {}, true);
+        window.setPersistenceTestState();
+        if (!window.frontendPersistenceTestState()) {
+            std::cerr << "Frontend changes were applied before confirmation or not applied afterwards\n";
+            return 1;
+        }
+        QEventLoop loop;
+        QTimer::singleShot(750, &loop, &QEventLoop::quit);
+        loop.exec();
+        QSettings settings;
+        settings.sync();
+        if (settings.status() != QSettings::NoError ||
+            settings.value("receiver/frequencyHz").toLongLong() != 438775000 ||
+            settings.value("receiver/mode").toString() != "AM" ||
+            settings.value("receiver/decoder").toString() != "DMR" ||
+            settings.value("receiver/volume").toInt() != 68 ||
+            !settings.value("receiver/muted").toBool() ||
+            settings.value("receiver/sdrAgc").toBool() ||
+            settings.value("receiver/sdrRfReduction").toInt() != 3 ||
+            settings.value("receiver/sdrIfReduction").toInt() != 31 ||
+            settings.value("receiver/sdrAgcSetpoint").toInt() != -42 ||
+            settings.value("receiver/sdrPpm").toDouble() != -2.5) {
+            std::cerr << "Receiver settings were not saved while ADS-B was active\n";
+            return 1;
+        }
+    }
+    {
+        Window window(true, false, {}, {}, true);
+        if (!window.persistenceDigitalRestored() || !window.frontendRestored()) {
+            std::cerr << "Digital receiver settings were not restored\n";
+            return 1;
+        }
+        window.setPersistenceAnalogState();
+    }
+    {
+        Window window(true, false, {}, {}, true);
+        if (!window.persistenceAnalogRestored() || !window.frontendRestored()) {
+            std::cerr << "Analog receiver settings were not restored\n";
+            return 1;
+        }
+        if (!window.frontendResetTest()) {
+            std::cerr << "Frontend defaults were not applied correctly\n";
+            return 1;
+        }
+    }
+    {
+        QSettings settings;
+        if (settings.value("qth").toString() != "KO02") return 1;
+        settings.setValue("receiver/frequencyHz", "invalid");
+        settings.setValue("receiver/decoder", "invalid");
+        settings.setValue("receiver/sdrRfReduction", 99);
+        settings.sync();
+        if (settings.status() != QSettings::NoError) return 1;
+    }
+    bool warned = false;
+    QTimer::singleShot(0, [&] {
+        if (auto *message = qobject_cast<QMessageBox *>(QApplication::activeModalWidget())) {
+            warned = true;
+            message->accept();
+        }
+    });
+    {
+        Window window(true, false, {}, {}, true);
+        if (!warned || !window.persistenceDefaultsRestored() || !window.frontendDefaultsRestored()) {
+            std::cerr << "Invalid receiver settings were not reported\n";
+            return 1;
+        }
+    }
+    std::cout << "Receiver settings restoration and ADS-B preservation passed\n";
+    return 0;
+}
 
 int hardwareTest(QApplication &app) {
     Receiver receiver(dataFile());
@@ -1521,7 +1914,62 @@ int hardwareTest(QApplication &app) {
     return result;
 }
 
-int scanTest(QApplication &app, Mode mode = Mode::LSB, bool fmBand = false, qint64 singleFrequency = 0) {
+int frontendHardwareTest(QApplication &app) {
+    QTemporaryDir directory;
+    if (!directory.isValid()) return 1;
+    Receiver receiver(directory.filePath("scan.csv"));
+    ReceiverSettings settings;
+    settings.frequency = 102400000;
+    settings.mode = Mode::WFM;
+    settings.frontend = {false, 3, 50, -30, 0};
+    receiver.configure(settings);
+    int phase = 0, applied = 0, lowCount = 0, highCount = 0;
+    double lowSum = 0, highSum = 0;
+    bool failed = false;
+    QObject::connect(&receiver, &Receiver::frontendApplied, &app, [&] { ++applied; });
+    QObject::connect(&receiver, &Receiver::failed, &app, [&](const QString &message) {
+        std::cerr << "Frontend hardware error: " << message.toStdString() << '\n';
+        failed = true;
+        app.quit();
+    });
+    QObject::connect(&receiver, &Receiver::audioGap, &app, [&] {
+        std::cerr << "Receiver sample gap during frontend changes\n";
+        failed = true;
+        app.quit();
+    });
+    QObject::connect(&receiver, &Receiver::signalLevel, &app, [&](double level) {
+        if (phase == 1) { lowSum += level; ++lowCount; }
+        if (phase == 3) { highSum += level; ++highCount; }
+    });
+    QTimer::singleShot(2000, &app, [&] { phase = 1; });
+    QTimer::singleShot(5000, &app, [&] {
+        phase = 2;
+        settings.frontend = {false, 0, 30, -40, 1.25};
+        receiver.configure(settings);
+    });
+    QTimer::singleShot(7000, &app, [&] { phase = 3; });
+    QTimer::singleShot(10000, &app, [&] {
+        phase = 4;
+        settings.frontend = FrontendSettings{};
+        receiver.configure(settings);
+    });
+    QTimer::singleShot(13000, &app, &QCoreApplication::quit);
+    receiver.start();
+    app.exec();
+    receiver.stop();
+    const double low = lowCount ? lowSum / lowCount : 0;
+    const double high = highCount ? highSum / highCount : 0;
+    std::cout << "Frontend settings applied: " << applied << ", low gain peak: " << low
+              << " dBFS, higher gain peak: " << high << " dBFS\n";
+    if (failed || applied < 3 || lowCount < 5 || highCount < 5 || high - low < 6) {
+        std::cerr << "Frontend gain change did not produce the expected level increase\n";
+        return 1;
+    }
+    return 0;
+}
+
+int scanTest(QApplication &app, Mode mode = Mode::LSB, bool fmBand = false, qint64 singleFrequency = 0,
+             bool changeFrontend = false) {
     QTemporaryDir temp;
     if (!temp.isValid()) {
         std::cerr << "Cannot create temporary scan directory\n";
@@ -1536,20 +1984,32 @@ int scanTest(QApplication &app, Mode mode = Mode::LSB, bool fmBand = false, qint
     settings.scanEnd = singleFrequency ? singleFrequency : fmBand ? 108000000 : 7102000;
     settings.scanStep = fmBand ? 100000 : 1000;
     settings.threshold = fmBand ? -60 : -200;
+    if (changeFrontend) {
+        settings.scanStart = 102400000;
+        settings.scanEnd = 103400000;
+        settings.scanStep = 100000;
+        settings.threshold = -80;
+    }
     settings.scanId = 123;
     receiver.configure(settings);
     int detections = 0;
     int resumedAudio = 0;
+    int frontendApplications = 0;
     bool scanDone = false;
+    QObject::connect(&receiver, &Receiver::frontendApplied, &app, [&] { ++frontendApplications; });
     QObject::connect(&receiver, &Receiver::audioReady, &app, [&](const QByteArray &, qint64) {
         if (scanDone) ++resumedAudio;
     });
-    QObject::connect(&receiver, &Receiver::detected, &app, [&](quint64 scanId, qint64, double, const QString &detectedMode) {
+    QObject::connect(&receiver, &Receiver::detected, &app, [&](quint64 scanId, qint64 frequency, double, const QString &detectedMode) {
         if (scanId != settings.scanId || detectedMode != storedMode(mode)) {
             std::cerr << "Incorrect scan identity or modulation\n";
             app.exit(1);
         }
         ++detections;
+        if (changeFrontend && detections == 1 && frequency < settings.scanEnd) {
+            settings.frontend.rfReduction = 2;
+            receiver.configure(settings);
+        }
     });
     QObject::connect(&receiver, &Receiver::failed, &app, [&app](const QString &message) {
         std::cerr << "Scan error: " << message.toStdString() << '\n';
@@ -1564,7 +2024,8 @@ int scanTest(QApplication &app, Mode mode = Mode::LSB, bool fmBand = false, qint
         }
         const auto lines = file.readAll().trimmed().split('\n');
         const int steps = int((settings.scanEnd - settings.scanStart) / settings.scanStep + 1);
-        if (scanId != settings.scanId || detections > steps || lines.size() != detections + 1 ||
+        if (scanId != settings.scanId || (changeFrontend && frontendApplications < 2) ||
+            detections > steps || lines.size() != detections + 1 ||
             lines[0] != "utc,frequency_hz,mode,peak_dbfs") {
             std::cerr << "Unexpected scan result shape\n";
             app.exit(1);
@@ -1647,6 +2108,11 @@ int audioTest(QApplication &app) {
 }
 
 int keyboardTest() {
+    auto key = [](QDialog *dialog, const QString &text) -> QPushButton * {
+        for (auto *button : dialog->findChildren<QPushButton *>())
+            if (button->text() == text) return button;
+        return nullptr;
+    };
     QLineEdit text;
     text.setText("STARA");
     text.show();
@@ -1676,6 +2142,7 @@ int keyboardTest() {
     QApplication::sendEvent(&text, &click);
     if (!textDialog || text.text() != "NOWA LISTA") return 1;
     QDoubleSpinBox number;
+    number.setLocale(QLocale(QLocale::Polish, QLocale::Poland));
     number.setRange(1, 200);
     number.setDecimals(3);
     number.setValue(7.1);
@@ -1688,17 +2155,106 @@ int keyboardTest() {
         if (!dialog) return;
         auto *input = dialog->findChild<QLineEdit *>("keyboardInput");
         auto *accept = dialog->findChild<QPushButton *>("keyboardAccept");
-        if (!input || !accept) { dialog->reject(); return; }
+        auto *error = dialog->findChild<QLabel *>("keyboardError");
+        if (!input || !accept || !error || key(dialog, "Q") || key(dialog, "-") || key(dialog, ".") ||
+            !key(dialog, ",")) { dialog->reject(); return; }
         input->setText("999");
         accept->click();
         if (!dialog->isVisible()) return;
-        input->setText(number.locale().toString(14.074, 'f', 3));
+        if (error->text().isEmpty()) { dialog->reject(); return; }
+        input->clear();
+        if (!error->text().isEmpty()) { dialog->reject(); return; }
+        for (const QString &character : {QString("1"), QString("4"), QString(","), QString("0"),
+                                         QString("7"), QString("4")}) {
+            auto *button = key(dialog, character);
+            if (!button) { dialog->reject(); return; }
+            button->click();
+        }
+        const QString path = qEnvironmentVariable("SDR_TOUCH_NUMERIC_SCREENSHOT");
+        if (!path.isEmpty() && !dialog->grab().save(path)) { dialog->reject(); return; }
         numericDialog = true;
         accept->click();
     });
     QMouseEvent numberClick(QEvent::MouseButtonRelease, QPointF(2, 2), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
     QApplication::sendEvent(line, &numberClick);
     if (!numericDialog || std::abs(number.value() - 14.074) > 0.0001) return 1;
+    QLineEdit coordinate;
+    auto *coordinateValidator = new QDoubleValidator(-90, 90, 6, &coordinate);
+    coordinateValidator->setNotation(QDoubleValidator::StandardNotation);
+    coordinateValidator->setLocale(QLocale::c());
+    coordinate.setValidator(coordinateValidator);
+    coordinate.show();
+    bool coordinateDialog = false;
+    QTimer::singleShot(0, [&] {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        if (!dialog) return;
+        auto *input = dialog->findChild<QLineEdit *>("keyboardInput");
+        auto *accept = dialog->findChild<QPushButton *>("keyboardAccept");
+        if (!input || !accept || key(dialog, "Q") || key(dialog, ",") || !key(dialog, ".") ||
+            !key(dialog, "-")) { dialog->reject(); return; }
+        for (const QString &character : {QString("-"), QString("5"), QString("2"), QString("."),
+                                         QString("1"), QString("2"), QString("3")}) {
+            auto *button = key(dialog, character);
+            if (!button) { dialog->reject(); return; }
+            button->click();
+        }
+        coordinateDialog = true;
+        accept->click();
+    });
+    QMouseEvent coordinateClick(QEvent::MouseButtonRelease, QPointF(2, 2), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&coordinate, &coordinateClick);
+    if (!coordinateDialog || coordinate.text() != "-52.123") return 1;
+    QDoubleSpinBox threshold;
+    threshold.setRange(-140, 0);
+    threshold.setDecimals(1);
+    threshold.setLocale(QLocale::c());
+    threshold.show();
+    auto *thresholdLine = threshold.findChild<QLineEdit *>();
+    if (!thresholdLine) return 1;
+    bool thresholdDialog = false;
+    QTimer::singleShot(0, [&] {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        if (!dialog) return;
+        auto *input = dialog->findChild<QLineEdit *>("keyboardInput");
+        auto *accept = dialog->findChild<QPushButton *>("keyboardAccept");
+        if (!input || !accept || key(dialog, "Q") || !key(dialog, "-") || !key(dialog, ".")) {
+            dialog->reject();
+            return;
+        }
+        input->clear();
+        for (const QString &character : {QString("-"), QString("5"), QString("5"), QString("."), QString("4")}) {
+            auto *button = key(dialog, character);
+            if (!button) { dialog->reject(); return; }
+            button->click();
+        }
+        thresholdDialog = true;
+        accept->click();
+    });
+    QMouseEvent thresholdClick(QEvent::MouseButtonRelease, QPointF(2, 2), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(thresholdLine, &thresholdClick);
+    if (!thresholdDialog || std::abs(threshold.value() + 55.4) > 0.0001) return 1;
+    QSpinBox integer;
+    integer.setRange(-10, 10);
+    integer.show();
+    auto *integerLine = integer.findChild<QLineEdit *>();
+    if (!integerLine) return 1;
+    bool integerDialog = false;
+    QTimer::singleShot(0, [&] {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        if (!dialog) return;
+        auto *input = dialog->findChild<QLineEdit *>("keyboardInput");
+        auto *accept = dialog->findChild<QPushButton *>("keyboardAccept");
+        if (!input || !accept || key(dialog, "Q") || key(dialog, ".") || key(dialog, ",") ||
+            !key(dialog, "-")) { dialog->reject(); return; }
+        input->clear();
+        key(dialog, "-")->click();
+        key(dialog, "4")->click();
+        integerDialog = true;
+        accept->click();
+    });
+    QMouseEvent integerClick(QEvent::MouseButtonRelease, QPointF(2, 2), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(integerLine, &integerClick);
+    if (!integerDialog || integer.value() != -4) return 1;
     QInputDialog nameDialog;
     nameDialog.setInputMode(QInputDialog::TextInput);
     nameDialog.setLabelText("Nazwa");
@@ -1741,6 +2297,29 @@ int main(int argc, char **argv) {
     QCoreApplication::setOrganizationName("SDRTouch");
     QCoreApplication::setApplicationName("SDRTouch");
     const QStringList args = app.arguments();
+    if (args.contains("--settings-test")) return receiverSettingsTest();
+    if (args.contains("--settings-hardware-test")) {
+        QTemporaryDir directory;
+        if (!directory.isValid()) return 1;
+        QCoreApplication::setOrganizationName("SDRTouchSettingsTest");
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, directory.path());
+        {
+            Window window(true, false, {}, {}, true);
+            window.setPersistenceTestState();
+        }
+        Window window;
+        QTimer::singleShot(8000, &app, [&] {
+            if (!window.persistenceLiveRestored()) {
+                std::cerr << "Restored receiver, IQ or muted audio output is not ready\n";
+                app.exit(1);
+            } else {
+                std::cout << "Restored DMR settings with live IQ and muted audio output\n";
+                app.exit(0);
+            }
+        });
+        return app.exec();
+    }
     if (args.contains("--install-digital-lists")) {
         try {
             const QString path = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
@@ -1758,7 +2337,9 @@ int main(int argc, char **argv) {
     }
     if (args.contains("--keyboard-test")) return keyboardTest();
     if (args.contains("--hardware-test")) return hardwareTest(app);
+    if (args.contains("--frontend-hardware-test")) return frontendHardwareTest(app);
     if (args.contains("--scan-test")) return scanTest(app);
+    if (args.contains("--scan-frontend-test")) return scanTest(app, Mode::WFM, false, 0, true);
     if (args.contains("--scan-am-test")) return scanTest(app, Mode::AM);
     if (args.contains("--scan-fm-test")) return scanTest(app, Mode::WFM, true);
     if (args.contains("--scan-fm-frequency-test")) {
@@ -1809,6 +2390,15 @@ int main(int argc, char **argv) {
         Window window(false, true, args.at(index + 1));
         window.show();
         QTimer::singleShot(2000, &app, [&] { window.startAdsbSmoke(false); });
+        QTimer::singleShot(8000, &app, [&] {
+            if (!window.adsbSmokeRunning()) {
+                std::cerr << "ADS-B was not running when testing frontend settings\n";
+                app.exit(1);
+            } else if (!window.frontendPersistenceTestState()) {
+                std::cerr << "Could not apply frontend settings while ADS-B was active\n";
+                app.exit(1);
+            }
+        });
         QTimer::singleShot(9000, &app, [&] {
             if (!window.stopAdsbSmoke(false)) {
                 std::cerr << "ADS-B normal receiver transition failed\n";
@@ -1816,6 +2406,12 @@ int main(int argc, char **argv) {
             }
         });
         QTimer::singleShot(12000, &app, [&] { window.startAdsbSmoke(true); });
+        QTimer::singleShot(11500, &app, [&] {
+            if (!window.frontendAppliedAfterAdsb()) {
+                std::cerr << "Frontend settings were not applied after ADS-B stopped\n";
+                app.exit(1);
+            }
+        });
         QTimer::singleShot(19000, &app, [&] {
             if (!window.stopAdsbSmoke(true)) {
                 std::cerr << "ADS-B FT4 transition failed\n";
@@ -1902,6 +2498,7 @@ int main(int argc, char **argv) {
         return app.exec();
     }
     if (args.contains("--ui-test") || args.contains("--voice-ui-test") || args.contains("--ui-scan-test") || args.contains("--sort-test") ||
+        args.contains("--frontend-ui-test") ||
         args.contains("--adsb-ui-test")) {
         std::unique_ptr<QTemporaryDir> testSettings;
         if (args.contains("--adsb-ui-test")) {
@@ -1911,6 +2508,7 @@ int main(int argc, char **argv) {
             QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, testSettings->path());
         }
         Window window(true);
+        if (args.contains("--frontend-ui-test")) window.showFrontendUi();
         if (args.contains("--voice-ui-test")) window.voiceUiTest();
         if (args.contains("--adsb-ui-test") && !window.adsbUiTest()) {
             std::cerr << "ADS-B UI test failed\n";

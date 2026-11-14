@@ -6,6 +6,7 @@
 #include <SoapySDR/Constants.h>
 #include <QDateTime>
 #include <QMutexLocker>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -36,6 +37,16 @@ void validate(const ReceiverSettings &s) {
     if (s.scan && (s.scanStart < minHz || s.scanEnd > maxHz || s.scanStart > s.scanEnd ||
                    s.scanStep < 1 || s.threshold < -200 || s.threshold > 0))
         throw std::invalid_argument("Nieprawidlowe parametry skanowania");
+    const auto &f = s.frontend;
+    if (f.rfReduction < 0 || f.rfReduction > 3 || f.ifReduction < 20 || f.ifReduction > 59 ||
+        f.agcSetpoint < -60 || f.agcSetpoint > 0 || !std::isfinite(f.ppm) || std::abs(f.ppm) > 100)
+        throw std::invalid_argument("Nieprawidlowe ustawienia SDRplay");
+}
+
+bool sameTuning(const ReceiverSettings &a, const ReceiverSettings &b) {
+    return a.frequency == b.frequency && a.mode == b.mode && a.scan == b.scan &&
+           a.scanStart == b.scanStart && a.scanEnd == b.scanEnd && a.scanStep == b.scanStep &&
+           a.threshold == b.threshold && a.scanId == b.scanId;
 }
 
 struct DeviceDeleter {
@@ -86,6 +97,15 @@ void Receiver::run() {
         device->setFrequency(SOAPY_SDR_RX, 0, 7100000);
         if (device->hasGainMode(SOAPY_SDR_RX, 0)) device->setGainMode(SOAPY_SDR_RX, 0, true);
         if (device->hasDCOffsetMode(SOAPY_SDR_RX, 0)) device->setDCOffsetMode(SOAPY_SDR_RX, 0, true);
+        const auto gains = device->listGains(SOAPY_SDR_RX, 0);
+        const auto settingInfo = device->getSettingInfo();
+        if (!device->hasGainMode(SOAPY_SDR_RX, 0) || !device->hasFrequencyCorrection(SOAPY_SDR_RX, 0) ||
+            std::find(gains.begin(), gains.end(), "RFGR") == gains.end() ||
+            std::find(gains.begin(), gains.end(), "IFGR") == gains.end() ||
+            std::none_of(settingInfo.begin(), settingInfo.end(), [](const SoapySDR::ArgInfo &info) {
+                return info.key == "agc_setpoint";
+            }))
+            throw std::runtime_error("Sterownik nie obsluguje wymaganych ustawien SDRplay");
         StreamGuard stream{device.get(), device->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)};
         if (!stream.stream) throw std::runtime_error("Nie mozna utworzyc strumienia SDR");
         int rc = device->activateStream(stream.stream);
@@ -120,6 +140,30 @@ void Receiver::run() {
             scanDetector.reset();
             tunedAt = std::chrono::steady_clock::now();
         };
+        auto applyFrontend = [&](const FrontendSettings &f) {
+            const auto rfRange = device->getGainRange(SOAPY_SDR_RX, 0, "RFGR");
+            const auto ifRange = device->getGainRange(SOAPY_SDR_RX, 0, "IFGR");
+            if (f.rfReduction < rfRange.minimum() || f.rfReduction > rfRange.maximum() ||
+                f.ifReduction < ifRange.minimum() || f.ifReduction > ifRange.maximum())
+                throw std::runtime_error("Ustawienie wzmocnienia jest poza zakresem urzadzenia");
+            if (device->readSetting("agc_setpoint") != std::to_string(f.agcSetpoint))
+                device->writeSetting("agc_setpoint", std::to_string(f.agcSetpoint));
+            if (device->getGainMode(SOAPY_SDR_RX, 0) != f.agc)
+                device->setGainMode(SOAPY_SDR_RX, 0, f.agc);
+            if (device->getGain(SOAPY_SDR_RX, 0, "RFGR") != f.rfReduction)
+                device->setGain(SOAPY_SDR_RX, 0, "RFGR", f.rfReduction);
+            if (!f.agc && device->getGain(SOAPY_SDR_RX, 0, "IFGR") != f.ifReduction)
+                device->setGain(SOAPY_SDR_RX, 0, "IFGR", f.ifReduction);
+            if (device->getFrequencyCorrection(SOAPY_SDR_RX, 0) != f.ppm)
+                device->setFrequencyCorrection(SOAPY_SDR_RX, 0, f.ppm);
+            if (device->readSetting("agc_setpoint") != std::to_string(f.agcSetpoint) ||
+                device->getGainMode(SOAPY_SDR_RX, 0) != f.agc ||
+                device->getGain(SOAPY_SDR_RX, 0, "RFGR") != f.rfReduction ||
+                (!f.agc && device->getGain(SOAPY_SDR_RX, 0, "IFGR") != f.ifReduction) ||
+                std::abs(device->getFrequencyCorrection(SOAPY_SDR_RX, 0) - f.ppm) > 0.001)
+                throw std::runtime_error("Sterownik nie potwierdzil ustawien SDRplay");
+            emit frontendApplied();
+        };
         emit statusChanged("RSP1: odbiornik gotowy");
         while (!stopping_) {
             ReceiverSettings requested;
@@ -131,8 +175,12 @@ void Receiver::run() {
             }
             if (newRevision != revision) {
                 validate(requested);
+                const bool tuningChanged = revision == 0 || !sameTuning(current, requested);
+                const bool frontendChanged = revision == 0 || current.frontend != requested.frontend;
                 current = requested;
                 revision = newRevision;
+                if (frontendChanged) applyFrontend(current.frontend);
+                if (!tuningChanged) continue;
                 processor.setMode(current.mode);
                 scanning = current.scan;
                 // WFM scanning also measures the spectrum beside the reception channel.
