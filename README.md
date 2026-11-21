@@ -18,14 +18,15 @@ else
 fi
 ```
 
-Plik skrótu wskazuje `/home/piasek/sdr-touch/build/sdr-touch`; przy innym użytkowniku
-trzeba dostosować pole `Exec`.
+Plik skrótu zawiera bezwzględną ścieżkę w polu `Exec`. W razie potrzeby dostosuj ją,
+aby wskazywała plik `sdr-touch/build/sdr-touch` w Twoim katalogu domowym
+(użyj pełnej ścieżki, bez `~`).
 
-Aby uruchomić program przez SSH na podłączonym ekranie
-przy obecnej konfiguracji sesji użytkownika `piasek`, wykonaj:
+Aby uruchomić program przez SSH na podłączonym ekranie, zaloguj się na to samo konto
+co sesja graficzna i wykonaj:
 
 ```sh
-XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 QT_QPA_PLATFORM=wayland ~/sdr-touch/build/sdr-touch
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" QT_QPA_PLATFORM=wayland ~/sdr-touch/build/sdr-touch
 ```
 
 Polecenie pozostaje uruchomione do zamknięcia okna. Przed startem zamknij inne programy
