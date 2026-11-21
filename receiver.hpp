@@ -28,6 +28,8 @@ struct ReceiverSettings {
     std::int64_t scanEnd = 7200000;
     std::int64_t scanStep = 1000;
     double threshold = -60;
+    bool squelchEnabled = false;
+    double squelchThresholdDbfs = -90;
     quint64 scanId = 0;
     FrontendSettings frontend;
 };
@@ -45,6 +47,7 @@ signals:
     void statusChanged(const QString &status);
     void failed(const QString &message);
     void audioReady(const QByteArray &pcm, qint64 captureEndMs, qint64 frequency, int mode);
+    void morseAudioReady(const QByteArray &pcm, qint64 frequency);
     void audioGap();
     void signalLevel(double dbfs);
     void detected(quint64 scanId, qint64 frequency, double dbfs, const QString &mode);

@@ -1,4 +1,5 @@
 #include "dsp.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -30,6 +31,30 @@ int main() {
         }
         if (detector.detected() != (count == 9)) {
             std::cerr << "Scan persistence boundary failed\n";
+            return 1;
+        }
+    }
+    {
+        SquelchGate gate;
+        std::vector<std::int16_t> audio(512, 12000);
+        if (gate.process(audio, -100, -90) ||
+            std::any_of(audio.begin(), audio.end(), [](std::int16_t sample) { return sample != 0; })) {
+            std::cerr << "Closed squelch passed audio below threshold\n";
+            return 1;
+        }
+        std::fill(audio.begin(), audio.end(), 12000);
+        if (!gate.process(audio, -89, -90) || audio.back() != 12000 || audio.front() == 12000) {
+            std::cerr << "Squelch did not open with a fade\n";
+            return 1;
+        }
+        std::fill(audio.begin(), audio.end(), 12000);
+        if (!gate.process(audio, -92, -90) || audio.back() != 12000) {
+            std::cerr << "Squelch hysteresis closed too early\n";
+            return 1;
+        }
+        std::fill(audio.begin(), audio.end(), 12000);
+        if (gate.process(audio, -94, -90) || audio.back() != 0 || audio.front() == 12000) {
+            std::cerr << "Squelch did not close with a fade\n";
             return 1;
         }
     }

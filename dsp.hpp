@@ -9,7 +9,7 @@ constexpr int kSampleRate = 384000;
 constexpr int kAudioRate = 48000;
 constexpr int kBlock = 2048;
 
-enum class Mode { LSB, USB, AM, NFM, WFM, DigitalUSB, DigitalVoice };
+enum class Mode { LSB, USB, AM, NFM, WFM, DigitalUSB, DigitalVoice, CW };
 
 struct SignalBlock {
     std::vector<std::int16_t> audio;
@@ -40,6 +40,14 @@ private:
     int blocks_ = 0;
     int hits_ = 0;
     double peak_ = -200;
+};
+
+class SquelchGate {
+public:
+    void reset();
+    bool process(std::vector<std::int16_t> &audio, double levelDbfs, double thresholdDbfs);
+private:
+    bool open_ = false;
 };
 
 class Processor {

@@ -21,7 +21,7 @@ void validate(const QVector<StationList> &lists) {
         for (const auto &station : list.stations) {
             if (station.frequencyHz < 10000 || station.frequencyHz > 2000000000 ||
                 (station.mode != "LSB" && station.mode != "USB" && station.mode != "AM" &&
-                 station.mode != "NFM" && station.mode != "WFM"))
+                 station.mode != "NFM" && station.mode != "WFM" && station.mode != "CW"))
                 throw std::invalid_argument("Nieprawidłowa częstotliwość lub modulacja na liście");
             const QString key = QString::number(station.frequencyHz) + "/" + station.mode;
             if (stations.contains(key)) throw std::invalid_argument("Powtórzona częstotliwość i modulacja");
@@ -31,7 +31,7 @@ void validate(const QVector<StationList> &lists) {
 }
 }
 
-int addDigitalLists(QVector<StationList> &lists) {
+int addDefaultLists(QVector<StationList> &lists) {
     const QVector<StationList> defaults{
         {"Cyfrowe FT8", {
             {"160 m", 1840000, "USB"}, {"80 m", 3573000, "USB"}, {"60 m", 5357000, "USB"},
@@ -46,7 +46,16 @@ int addDigitalLists(QVector<StationList> &lists) {
         {"Cyfrowe WSPR", {
             {"160 m", 1836600, "USB"}, {"80 m", 3568600, "USB"}, {"40 m", 7038600, "USB"},
             {"30 m", 10138700, "USB"}, {"20 m", 14095600, "USB"}, {"17 m", 18104600, "USB"},
-            {"15 m", 21094600, "USB"}, {"12 m", 24924600, "USB"}, {"10 m", 28124600, "USB"}}}
+            {"15 m", 21094600, "USB"}, {"12 m", 24924600, "USB"}, {"10 m", 28124600, "USB"}}},
+        {"PMR446", {
+            {"Kanał 1", 446006250, "NFM"}, {"Kanał 2", 446018750, "NFM"},
+            {"Kanał 3", 446031250, "NFM"}, {"Kanał 4", 446043750, "NFM"},
+            {"Kanał 5", 446056250, "NFM"}, {"Kanał 6", 446068750, "NFM"},
+            {"Kanał 7", 446081250, "NFM"}, {"Kanał 8", 446093750, "NFM"},
+            {"Kanał 9", 446106250, "NFM"}, {"Kanał 10", 446118750, "NFM"},
+            {"Kanał 11", 446131250, "NFM"}, {"Kanał 12", 446143750, "NFM"},
+            {"Kanał 13", 446156250, "NFM"}, {"Kanał 14", 446168750, "NFM"},
+            {"Kanał 15", 446181250, "NFM"}, {"Kanał 16", 446193750, "NFM"}}}
     };
     int added = 0;
     for (const auto &candidate : defaults) {

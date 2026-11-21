@@ -27,6 +27,7 @@ QString modeName(Mode mode) {
     case Mode::AM: return "AM";
     case Mode::NFM: return "NFM";
     case Mode::WFM: return "WFM";
+    case Mode::CW: return "CW";
     }
     throw std::invalid_argument("Unknown mode");
 }
@@ -37,6 +38,9 @@ void validate(const ReceiverSettings &s) {
     if (s.scan && (s.scanStart < minHz || s.scanEnd > maxHz || s.scanStart > s.scanEnd ||
                    s.scanStep < 1 || s.threshold < -200 || s.threshold > 0))
         throw std::invalid_argument("Nieprawidlowe parametry skanowania");
+    if (!std::isfinite(s.squelchThresholdDbfs) ||
+        s.squelchThresholdDbfs < -140 || s.squelchThresholdDbfs > 0)
+        throw std::invalid_argument("Nieprawidlowy prog squelch");
     const auto &f = s.frontend;
     if (f.rfReduction < 0 || f.rfReduction > 3 || f.ifReduction < 20 || f.ifReduction > 59 ||
         f.agcSetpoint < -60 || f.agcSetpoint > 0 || !std::isfinite(f.ppm) || std::abs(f.ppm) > 100)
@@ -119,6 +123,7 @@ void Receiver::run() {
         bool scanning = false;
         double bandwidth = 200000;
         ScanDetector scanDetector;
+        SquelchGate squelch;
         std::unique_ptr<ScanLog> resultLog;
         std::vector<std::complex<float>> samples(kBlock);
         int filled = 0;
@@ -138,6 +143,7 @@ void Receiver::run() {
             shift = double(offset);
             filled = 0;
             scanDetector.reset();
+            squelch.reset();
             tunedAt = std::chrono::steady_clock::now();
         };
         auto applyFrontend = [&](const FrontendSettings &f) {
@@ -177,9 +183,13 @@ void Receiver::run() {
                 validate(requested);
                 const bool tuningChanged = revision == 0 || !sameTuning(current, requested);
                 const bool frontendChanged = revision == 0 || current.frontend != requested.frontend;
+                const bool squelchChanged = revision == 0 ||
+                    current.squelchEnabled != requested.squelchEnabled ||
+                    current.squelchThresholdDbfs != requested.squelchThresholdDbfs;
                 current = requested;
                 revision = newRevision;
                 if (frontendChanged) applyFrontend(current.frontend);
+                if (squelchChanged) squelch.reset();
                 if (!tuningChanged) continue;
                 processor.setMode(current.mode);
                 scanning = current.scan;
@@ -228,10 +238,13 @@ void Receiver::run() {
             }
             if (scanning && now - tunedAt <
                 std::chrono::milliseconds(current.mode == Mode::WFM ? 400 : 250)) continue;
-            bool measure = scanning || now - lastLevel >= std::chrono::milliseconds(200);
+            const bool reportLevel = scanning || now - lastLevel >= std::chrono::milliseconds(200);
+            const bool squelchActive = current.squelchEnabled &&
+                current.mode != Mode::DigitalUSB && current.mode != Mode::DigitalVoice;
+            const bool measure = reportLevel || (!scanning && squelchActive);
             const qint64 captureEndMs = QDateTime::currentMSecsSinceEpoch();
             auto result = processor.process(samples, shift, measure);
-            if (measure) {
+            if (reportLevel) {
                 emit signalLevel(result.peakDbfs);
                 lastLevel = now;
             }
@@ -240,6 +253,12 @@ void Receiver::run() {
                 if (++underruns == 20) emit statusChanged("Ostrzezenie: zbyt malo danych audio z DSP");
             }
             if (!scanning) {
+                if (current.mode == Mode::CW && !result.dspUnderrun)
+                    emit morseAudioReady(QByteArray(reinterpret_cast<const char *>(result.audio.data()),
+                                                   int(result.audio.size() * sizeof(std::int16_t))),
+                                         current.frequency);
+                if (squelchActive)
+                    squelch.process(result.audio, result.peakDbfs, current.squelchThresholdDbfs);
                 emit audioReady(QByteArray(reinterpret_cast<const char *>(result.audio.data()),
                                            int(result.audio.size() * sizeof(std::int16_t))), captureEndMs,
                                 current.frequency, int(current.mode));

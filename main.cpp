@@ -5,11 +5,14 @@
 #include "touch_keyboard.hpp"
 #include "adsb.hpp"
 #include "voice.hpp"
+#include "aprs.hpp"
+#include "morse.hpp"
 #include <QAbstractButton>
 #include <QApplication>
 #include <QAudioDeviceInfo>
 #include <QAudioFormat>
 #include <QAudioOutput>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDir>
@@ -21,14 +24,18 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
+#include <QGroupBox>
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QList>
 #include <QProcess>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPixmap>
+#include <QPlainTextEdit>
+#include <QPair>
 #include <QPushButton>
 #include <QProgressBar>
 #include <QSignalBlocker>
@@ -38,6 +45,8 @@
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTabWidget>
+#include <QTextCursor>
+#include <QTextDocument>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -48,6 +57,7 @@
 namespace {
 constexpr int voiceDmr = 100;
 constexpr int voiceYsf = 101;
+constexpr int aprs1200 = 102;
 QString dataFile() {
     return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("sygnaly.csv");
 }
@@ -70,7 +80,51 @@ QComboBox *modeBox() {
     box->addItem("AM", int(Mode::AM));
     box->addItem("NFM", int(Mode::NFM));
     box->addItem("WFM mono", int(Mode::WFM));
+    box->addItem("CW", int(Mode::CW));
     return box;
+}
+
+QList<QPair<qint64, QString>> scanStepOptions(Mode mode) {
+    switch (mode) {
+    case Mode::LSB:
+    case Mode::USB:
+    case Mode::CW:
+        return {{100, "0,1 kHz"}, {250, "0,25 kHz"}, {500, "0,5 kHz"},
+                {1000, "1 kHz"}, {2500, "2,5 kHz"}, {5000, "5 kHz"}};
+    case Mode::AM:
+        return {{5000, "5 kHz"}, {8333, "8,33 kHz"}, {9000, "9 kHz"},
+                {10000, "10 kHz"}, {12500, "12,5 kHz"}, {25000, "25 kHz"}};
+    case Mode::NFM:
+        return {{6250, "6,25 kHz"}, {12500, "12,5 kHz"}, {25000, "25 kHz"}};
+    case Mode::WFM:
+        return {{50000, "50 kHz"}, {100000, "100 kHz"}, {200000, "200 kHz"}};
+    case Mode::DigitalUSB:
+    case Mode::DigitalVoice:
+        return {{1000, "1 kHz"}};
+    }
+    return {{1000, "1 kHz"}};
+}
+
+qint64 recommendedScanStep(Mode mode, qint64 frequencyHz) {
+    switch (mode) {
+    case Mode::AM:
+        if (frequencyHz >= 118000000 && frequencyHz < 137000000) return 8333;
+        if (frequencyHz >= 530000 && frequencyHz <= 1710000) return 9000;
+        if (frequencyHz > 1710000 && frequencyHz < 30000000) return 5000;
+        if (frequencyHz >= 225000000 && frequencyHz <= 400000000) return 25000;
+        return 12500;
+    case Mode::WFM:
+        return frequencyHz >= 87500000 && frequencyHz <= 108000000 ? 100000 : 50000;
+    case Mode::CW:
+        return 500;
+    case Mode::LSB:
+    case Mode::USB:
+    case Mode::NFM:
+    case Mode::DigitalUSB:
+    case Mode::DigitalVoice:
+        return mode == Mode::NFM ? 12500 : 1000;
+    }
+    return 1000;
 }
 
 QString storedMode(Mode mode) {
@@ -80,6 +134,7 @@ QString storedMode(Mode mode) {
     case Mode::AM: return "AM";
     case Mode::NFM: return "NFM";
     case Mode::WFM: return "WFM";
+    case Mode::CW: return "CW";
     case Mode::DigitalUSB: return "USB";
     case Mode::DigitalVoice: return "NFM";
     }
@@ -108,12 +163,48 @@ public:
         : adsbExecutable_(std::move(adsbExecutable)), persistSettings_(test ? testSettings : !mute) {
         setWindowTitle("SDR Touch – RSP1");
         resize(1024, 600);
-        setStyleSheet("QPushButton { min-height: 36px; } "
-                      "QDoubleSpinBox, QComboBox { min-height: 34px; } "
+        setStyleSheet("QWidget { background-color: #1b1f24; color: #d9e0e6; font-size: 13px; } "
+                      "QTabWidget::pane { background: #1e2329; border: 1px solid #39424b; } "
+                      "QTabBar::tab { background: #262c33; color: #aeb8c2; "
+                      "border: 1px solid #39424b; border-bottom: 0; padding: 4px 12px; min-height: 26px; } "
+                      "QTabBar::tab:selected { background: #1e2329; color: #69d0df; "
+                      "border-top: 2px solid #35b8cc; } "
+                      "QPushButton { background: #2a323a; color: #d9e0e6; border: 1px solid #46515b; "
+                      "border-radius: 3px; padding: 0 8px; min-height: 36px; } "
+                      "QPushButton:hover { background: #35414a; border-color: #55bdcc; } "
+                      "QPushButton:pressed, QPushButton:checked { background: #174d59; border-color: #35a9ba; } "
+                      "QPushButton:disabled { background: #22272d; color: #76818b; border-color: #30373e; } "
+                      "QCheckBox::indicator { width: 18px; height: 18px; background: #11161a; "
+                      "border: 1px solid #aeb8c2; border-radius: 2px; } "
+                      "QCheckBox::indicator:checked { background: #35a9ba; border-color: #70cbd8; } "
+                      "QCheckBox::indicator:disabled { border-color: #46515b; } "
+                      "QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox { background: #11161a; color: #e3e9ee; "
+                      "border: 1px solid #414b55; border-radius: 3px; padding: 1px 5px; min-height: 34px; "
+                      "selection-background-color: #176273; } "
+                      "QComboBox::drop-down { width: 30px; border-left: 1px solid #414b55; } "
+                      "QComboBox::down-arrow { image: url(:/arrows/down.xpm); width: 9px; height: 6px; } "
                       "QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { width: 30px; } "
-                      "QComboBox::drop-down { width: 30px; } "
-                      "QSlider::handle:horizontal { width: 22px; margin: -7px 0; }");
+                      "QAbstractSpinBox::up-arrow { image: url(:/arrows/up.xpm); width: 9px; height: 6px; } "
+                      "QAbstractSpinBox::down-arrow { image: url(:/arrows/down.xpm); width: 9px; height: 6px; } "
+                      "QTableWidget { background: #1d2228; alternate-background-color: #242a30; "
+                      "color: #d9e0e6; gridline-color: #343c44; border: 1px solid #39424b; "
+                      "selection-background-color: #155465; } "
+                      "QHeaderView::section { background: #292f36; color: #b8c5ce; "
+                      "border: 0; border-right: 1px solid #39424b; border-bottom: 1px solid #39424b; "
+                      "padding: 6px; } "
+                      "QGroupBox { background: #20262c; border: 1px solid #39424b; "
+                      "border-radius: 3px; margin-top: 6px; padding-top: 4px; } "
+                      "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; "
+                      "color: #70cbd8; } "
+                      "QProgressBar { background: #11161a; border: 1px solid #39424b; } "
+                      "QProgressBar::chunk { background: #25aabd; } "
+                      "QSlider::groove:horizontal { height: 4px; background: #414b55; } "
+                      "QSlider::handle:horizontal { width: 22px; margin: -8px 0; "
+                      "background: #55c5d3; border-radius: 4px; } "
+                      "QLabel#sectionTitle { color: #70cbd8; font-weight: 600; padding: 3px 0; }");
         auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(8, 8, 8, 6);
+        root->setSpacing(6);
         pages_ = new QTabWidget;
         auto *home = new QWidget;
         auto *homeLayout = new QVBoxLayout(home);
@@ -123,11 +214,24 @@ public:
         auto *adsbLayout = new QVBoxLayout(adsbPage);
         auto *frontendPage = new QWidget;
         auto *frontendLayout = new QVBoxLayout(frontendPage);
+        auto *morsePage = new QWidget;
+        auto *morseLayout = new QVBoxLayout(morsePage);
         pages_->addTab(home, "Odbiornik");
         pages_->addTab(scanPage, "Skanowanie i listy");
         pages_->addTab(adsbPage, "Samoloty ADS-B");
         pages_->addTab(frontendPage, "Ustawienia SDR");
+        pages_->addTab(morsePage, "Morse CW");
         root->addWidget(pages_, 1);
+        morseStatus_ = new QLabel("Wybierz tryb CW na ekranie Odbiornik.");
+        morseText_ = new QPlainTextEdit;
+        morseText_->setReadOnly(true);
+        morseText_->setPlaceholderText("Tutaj pojawi się rozpoznany tekst Morse'a.");
+        auto *clearMorse = new QPushButton("Wyczyść tekst CW");
+        clearMorse->setObjectName("clearMorse");
+        connect(clearMorse, &QPushButton::clicked, morseText_, &QPlainTextEdit::clear);
+        morseLayout->addWidget(morseStatus_);
+        morseLayout->addWidget(morseText_, 1);
+        morseLayout->addWidget(clearMorse, 0, Qt::AlignRight);
         auto *frontendForm = new QFormLayout;
         frontendAgc_ = new QComboBox;
         frontendAgc_->addItem("Automatyczne AGC", true);
@@ -146,12 +250,38 @@ public:
         frontendPpm_->setSingleStep(0.1);
         frontendPpm_->setSuffix(" ppm");
         frontendPpm_->setKeyboardTracking(false);
+        qth_ = new QLineEdit;
+        qth_->setObjectName("qthLocator");
+        qth_->setPlaceholderText("np. KO02");
+        qth_->setMaxLength(8);
+        qth_->setMaximumWidth(180);
+        if (!test) {
+            savedQth_ = QSettings().value("qth").toString().trimmed().toUpper();
+            if (!savedQth_.isEmpty() && !maidenheadLocation(savedQth_)) {
+                invalidQth_ = true;
+                savedQth_.clear();
+            }
+            qth_->setText(savedQth_);
+        }
+        auto *saveQth = new QPushButton("Zapisz QTH");
+        qthStatus_ = new QLabel(invalidQth_ ? "Zapisany lokator jest nieprawidłowy" :
+                                savedQth_.isEmpty() ? "Wpisz lokator, aby obliczać odległości." :
+                                                     "Lokator używany do obliczania odległości");
+        qthStatus_->setWordWrap(true);
+        auto *qthGroup = new QGroupBox("Pozycja i lokator");
+        auto *qthForm = new QFormLayout(qthGroup);
+        auto *qthControls = new QHBoxLayout;
+        qthControls->addWidget(qth_);
+        qthControls->addWidget(saveQth);
+        qthForm->addRow("Mój lokator Maidenhead", qthControls);
+        qthForm->addRow(qthStatus_);
         frontendForm->addRow("Sterowanie IF", frontendAgc_);
         frontendForm->addRow("Tłumienie RF (LNA, 0–3)", frontendRf_);
         frontendForm->addRow("Tłumienie IF", frontendIf_);
         frontendForm->addRow("Poziom docelowy AGC", frontendSetpoint_);
         frontendForm->addRow("Korekcja częstotliwości", frontendPpm_);
         frontendLayout->addLayout(frontendForm);
+        frontendLayout->addWidget(qthGroup);
         auto *frontendNote = new QLabel(
             "Mniejsze tłumienie RF/IF zwiększa wzmocnienie, ale może powodować przesterowanie. "
             "Korekcję ppm ustawiaj tylko po sprawdzeniu wzorca. ADS-B używa osobnych ustawień.");
@@ -184,9 +314,20 @@ public:
             frontendStatus_->setText(adsb_ ? "Ustawienia zostaną użyte po wyłączeniu ADS-B." :
                                             "Wysyłanie ustawień do odbiornika...");
         });
+        auto *receiverPanel = new QGroupBox("Odbiór");
+        auto *receiverLayout = new QVBoxLayout(receiverPanel);
         auto *grid = new QGridLayout;
         frequency_ = frequencyBox(7.1);
         mode_ = modeBox();
+        squelch_ = new QCheckBox("Squelch");
+        squelch_->setToolTip("Wycisza analogowe audio poniżej progu; nie wpływa na wyniki skanowania ani dekodery.");
+        squelchThreshold_ = new QDoubleSpinBox;
+        squelchThreshold_->setRange(-140, 0);
+        squelchThreshold_->setDecimals(1);
+        squelchThreshold_->setValue(-90);
+        squelchThreshold_->setSuffix(" dBFS");
+        squelchThreshold_->setMinimumWidth(95);
+        squelchThreshold_->setToolTip("Próg squelch według wskaźnika poziomu sygnału.");
         volume_ = new QSlider(Qt::Horizontal);
         volume_->setRange(0, 100);
         volume_->setValue(mute ? 0 : 35);
@@ -206,8 +347,16 @@ public:
         grid->addWidget(volume_, 0, 5);
         grid->addWidget(mute_, 0, 6);
         grid->addWidget(signal_, 1, 0, 1, 2);
-        grid->addWidget(meter_, 1, 2, 1, 5);
-        homeLayout->addLayout(grid);
+        grid->addWidget(meter_, 1, 2, 1, 3);
+        auto *squelchControls = new QWidget;
+        auto *squelchLayout = new QHBoxLayout(squelchControls);
+        squelchLayout->setContentsMargins(0, 0, 0, 0);
+        squelchLayout->setSpacing(6);
+        squelchLayout->addWidget(squelch_);
+        squelchLayout->addWidget(squelchThreshold_);
+        squelchLayout->addStretch();
+        grid->addWidget(squelchControls, 1, 5, 1, 2);
+        receiverLayout->addLayout(grid);
         auto *stationControls = new QHBoxLayout;
         mainList_ = new QComboBox;
         mainList_->setPlaceholderText("Utwórz listę w skanerze");
@@ -220,16 +369,12 @@ public:
         stationControls->addWidget(previousStation_);
         stationControls->addWidget(stationChoice_, 2);
         stationControls->addWidget(nextStation_);
-        homeLayout->addLayout(stationControls);
+        receiverLayout->addLayout(stationControls);
         auto *scanGrid = new QGridLayout;
         start_ = frequencyBox(7.0);
         end_ = frequencyBox(7.2);
-        step_ = new QDoubleSpinBox;
-        step_->setRange(0.001, 2000000);
-        step_->setDecimals(3);
-        step_->setValue(1);
-        step_->setSuffix(" kHz");
-        step_->setKeyboardTracking(false);
+        step_ = new QComboBox;
+        step_->setMinimumWidth(90);
         threshold_ = new QDoubleSpinBox;
         threshold_->setRange(-140, 0);
         threshold_->setDecimals(1);
@@ -237,6 +382,7 @@ public:
         threshold_->setSuffix(" dBFS");
         threshold_->setKeyboardTracking(false);
         scanMode_ = modeBox();
+        updateScanSteps();
         scanGrid->addWidget(new QLabel("Od"), 0, 0);
         scanGrid->addWidget(start_, 0, 1);
         scanGrid->addWidget(new QLabel("Do"), 0, 2);
@@ -258,31 +404,16 @@ public:
         digitalMode_->addItem("WSPR", int(DigitalMode::WSPR));
         digitalMode_->addItem("DMR", voiceDmr);
         digitalMode_->addItem("C4FM (YSF)", voiceYsf);
-        qth_ = new QLineEdit;
-        qth_->setPlaceholderText("np. KO02");
-        qth_->setMaxLength(8);
-        qth_->setMaximumWidth(110);
-        if (!test) {
-            savedQth_ = QSettings().value("qth").toString().trimmed().toUpper();
-            if (!savedQth_.isEmpty() && !maidenheadLocation(savedQth_)) {
-                invalidQth_ = true;
-                savedQth_.clear();
-            }
-            qth_->setText(savedQth_);
-        }
-        auto *saveQth = new QPushButton("Zapisz QTH");
+        digitalMode_->addItem("APRS 1200", aprs1200);
         digitalControls->addWidget(new QLabel("Dekoder"));
         digitalControls->addWidget(digitalMode_);
-        digitalControls->addWidget(new QLabel("Mój lokator"));
-        digitalControls->addWidget(qth_);
-        digitalControls->addWidget(saveQth);
         clockStatus_ = new QLabel("NTP: sprawdzanie");
         digitalControls->addWidget(clockStatus_);
         digitalStatus_ = new QLabel("Dekodowanie wyłączone");
         digitalStatus_->setWordWrap(true);
-        if (invalidQth_) digitalStatus_->setText("Zapisany QTH jest nieprawidłowy");
         digitalControls->addWidget(digitalStatus_, 1);
-        homeLayout->addLayout(digitalControls);
+        receiverLayout->addLayout(digitalControls);
+        homeLayout->addWidget(receiverPanel);
         voiceMetadata_ = new QLabel("Brak danych");
         voiceMetadata_->setVisible(false);
         homeLayout->addWidget(voiceMetadata_);
@@ -301,6 +432,7 @@ public:
         digitalTable_->setColumnWidth(7, 65);
         digitalTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
         digitalTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        digitalTable_->setAlternatingRowColors(true);
         digitalTable_->verticalHeader()->hide();
         digitalTable_->horizontalHeader()->setSortIndicatorShown(false);
         connect(digitalTable_->horizontalHeader(), &QHeaderView::sectionClicked, this, [this](int column) {
@@ -312,27 +444,10 @@ public:
             }
             sortMessages();
         });
-        auto *messageControls = new QHBoxLayout;
-        newest_ = new QPushButton("Najnowsze");
-        farthest_ = new QPushButton("Najdalsze");
+        auto *messagesTitle = new QLabel("Wiadomości cyfrowe");
+        messagesTitle->setObjectName("sectionTitle");
+        homeLayout->addWidget(messagesTitle);
         clearMessages_ = new QPushButton("Wyczyść wyniki");
-        messageControls->addWidget(new QLabel("Wiadomości cyfrowe"), 1);
-        messageControls->addWidget(newest_);
-        messageControls->addWidget(farthest_);
-        messageControls->addWidget(clearMessages_);
-        homeLayout->addLayout(messageControls);
-        connect(newest_, &QPushButton::clicked, this, [this] {
-            sortColumn_ = 0;
-            sortOrder_ = Qt::DescendingOrder;
-            sortMessages();
-            digitalTable_->scrollToTop();
-        });
-        connect(farthest_, &QPushButton::clicked, this, [this] {
-            sortColumn_ = 7;
-            sortOrder_ = Qt::DescendingOrder;
-            sortMessages();
-            digitalTable_->scrollToTop();
-        });
         connect(clearMessages_, &QPushButton::clicked, this, [this] {
             if (digitalTable_->rowCount() == 0) return;
             if (QMessageBox::question(this, "Wyczyść wyniki",
@@ -447,7 +562,12 @@ public:
         aircraftNote->setWordWrap(true);
         adsbLayout->addWidget(aircraftNote);
         auto *closeButton = new QPushButton("Zamknij");
-        root->addWidget(closeButton);
+        closeButton->setObjectName("closeButton");
+        auto *exitControls = new QHBoxLayout;
+        exitControls->addStretch();
+        exitControls->addWidget(clearMessages_);
+        exitControls->addWidget(closeButton);
+        root->addLayout(exitControls);
         status_ = new QLabel(test ? "Test interfejsu" : "Łączenie z odbiornikiem...");
         audioStatus_ = new QLabel;
         root->addWidget(status_);
@@ -457,6 +577,7 @@ public:
         settingsTimer_->setInterval(500);
         connect(settingsTimer_, &QTimer::timeout, this, [this] { saveReceiverSettings(); });
         const int restoredDigital = persistSettings_ ? restoreReceiverSettings() : 0;
+        updateSquelchControls();
         connect(closeButton, &QPushButton::clicked, this, &QWidget::close);
         connect(mute_, &QPushButton::toggled, this, [this](bool muted) {
             mute_->setText(muted ? "Włącz dźwięk" : "Wycisz");
@@ -468,6 +589,15 @@ public:
             if (audio_ && !mute_->isChecked() && !adsb_) audio_->setVolume(value / 100.0);
             scheduleReceiverSettings();
         });
+        connect(squelch_, &QCheckBox::toggled, this, [this] {
+            updateSquelchControls();
+            applySettings();
+            scheduleReceiverSettings();
+        });
+        connect(squelchThreshold_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] {
+            applySettings();
+            scheduleReceiverSettings();
+        });
         connect(frequency_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] {
             applySettings();
             scheduleReceiverSettings();
@@ -477,6 +607,12 @@ public:
             if (!digitalEnabled_ && digitalMode_->currentData().toInt() == int(DigitalMode::Off))
                 scheduleReceiverSettings();
         });
+        connect(scanMode_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+            updateScanSteps();
+        });
+        connect(start_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] {
+            updateScanSteps();
+        });
         connect(digitalMode_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, test] {
             if (!digital_ && !test) return;
             const bool enabled = digitalMode_->currentData().toInt() != int(DigitalMode::Off);
@@ -485,8 +621,10 @@ public:
             } else if (!enabled && digitalEnabled_) {
                 mode_->setCurrentIndex(previousMode_);
             }
-            if (enabled) mode_->setCurrentIndex(mode_->findData(int(voiceMode() == VoiceMode::Off ? Mode::USB : Mode::NFM)));
+            if (enabled) mode_->setCurrentIndex(mode_->findData(int(
+                voiceMode() == VoiceMode::Off && !aprsSelected() ? Mode::USB : Mode::NFM)));
             digitalEnabled_ = enabled;
+            updateSquelchControls();
             voiceMetadata_->setVisible(voiceMode() != VoiceMode::Off);
             mode_->setEnabled(!enabled && !scanning_);
             scanButton_->setEnabled(!enabled && receiver_ && receiver_->isRunning());
@@ -533,6 +671,30 @@ public:
             digitalStatus_->setText("Błąd dekodera: " + QString::fromUtf8(error.what()));
         }
         voice_ = new VoiceDecoder(this, std::move(voiceExecutable));
+        aprs_ = new AprsDecoder(this);
+        connect(aprs_, &AprsDecoder::statusChanged, digitalStatus_, &QLabel::setText);
+        connect(aprs_, &AprsDecoder::failed, this, [this](const QString &message) {
+            digitalMode_->setCurrentIndex(0);
+            digitalStatus_->setText("Błąd APRS: " + message);
+        });
+        connect(aprs_, &AprsDecoder::packetReceived, this, [this](const QString &packet, qint64 frequency) {
+            addAprsPacket(packet, frequency);
+        });
+        morse_ = new MorseDecoder(this);
+        connect(morse_, &MorseDecoder::started, this, [this](qint64 frequency) {
+            appendMorseText(QString("\n[%1 MHz]\n").arg(frequency / 1000000.0, 0, 'f', 6));
+        });
+        connect(morse_, &MorseDecoder::textReceived, this, [this](const QString &text) {
+            appendMorseText(text);
+        });
+        connect(morse_, &MorseDecoder::statusChanged, this, [this](const QString &message) {
+            morseStatus_->setText(message);
+            digitalStatus_->setText(message);
+        });
+        connect(morse_, &MorseDecoder::failed, this, [this](const QString &message) {
+            morseStatus_->setText(message);
+            digitalStatus_->setText(message);
+        });
         voiceAudioTimer_ = new QTimer(this);
         voiceAudioTimer_->setInterval(10);
         connect(voiceAudioTimer_, &QTimer::timeout, this, [this] { flushVoiceAudio(); });
@@ -612,6 +774,15 @@ public:
         connect(receiver_, &Receiver::audioGap, this, [this] {
             if (digital_ && !adsb_) digital_->resetCapture();
             if (voice_ && !adsb_) voice_->gap();
+            if (aprs_ && !adsb_) aprs_->gap();
+            if (morse_ && !adsb_) morse_->gap();
+        });
+        connect(receiver_, &Receiver::morseAudioReady, this, [this](const QByteArray &pcm, qint64 frequency) {
+            const auto desired = settings();
+            if (!adsb_ && !scanning_ && desired.mode == Mode::CW && desired.frequency == frequency && morse_) {
+                ++morseInputBlocks_;
+                morse_->feed(pcm);
+            }
         });
         connect(receiver_, &Receiver::signalLevel, this, [this](double level) {
             if (adsb_) return;
@@ -643,6 +814,13 @@ public:
                 }
                 return;
             }
+            if (aprsSelected()) {
+                if (aprs_ && !scanning_) {
+                    aprs_->feed(pcm);
+                    if (aprsInputBlocks_ <= 100) ++aprsInputBlocks_;
+                }
+                return;
+            }
             if (digital_ && !scanning_) digital_->feed(pcm, timestamp);
             if (!scanning_) playAudio(pcm);
         });
@@ -657,6 +835,7 @@ public:
         connect(saveQth, &QPushButton::clicked, this, [this] {
             const QString locator = qth_->text().trimmed().toUpper();
             if (!locator.isEmpty() && !maidenheadLocation(locator)) {
+                qthStatus_->setText("Nieprawidłowy lokator; wpisz 4, 6 lub 8 znaków.");
                 QMessageBox::warning(this, "QTH", "Podaj poprawny lokator Maidenhead (4, 6 lub 8 znaków).");
                 return;
             }
@@ -664,6 +843,7 @@ public:
             settings.setValue("qth", locator);
             settings.sync();
             if (settings.status() != QSettings::NoError) {
+                qthStatus_->setText("Nie udało się zapisać lokatora.");
                 QMessageBox::warning(this, "QTH", "Nie udało się zapisać lokatora.");
                 return;
             }
@@ -671,7 +851,7 @@ public:
             savedQth_ = locator;
             for (int row = 0; row < digitalTable_->rowCount(); ++row) updateDistance(row);
             sortMessages();
-            digitalStatus_->setText(locator.isEmpty() ? "Usunięto lokator QTH" : "Zapisano lokator QTH");
+            qthStatus_->setText(locator.isEmpty() ? "Usunięto lokator QTH" : "Zapisano lokator QTH");
         });
         if (digital_) digitalMode_->setCurrentIndex(restoredDigital);
         restoringSettings_ = false;
@@ -710,6 +890,10 @@ public:
         }
         delete voice_;
         voice_ = nullptr;
+        delete aprs_;
+        aprs_ = nullptr;
+        delete morse_;
+        morse_ = nullptr;
         if (audio_) {
             disconnect(audio_, nullptr, this, nullptr);
             audio_->stop();
@@ -728,13 +912,16 @@ public:
         adsb_ = new AdsbDecoder(this);
         digitalMode_->setCurrentIndex(0);
         volume_->setValue(68);
+        squelchThreshold_->setValue(-72.5);
+        squelch_->setChecked(true);
     }
     bool persistenceDigitalRestored() const {
         return std::llround(frequency_->value() * 1000000) == 438775000 &&
             mode_->currentData().toInt() == int(Mode::NFM) &&
             mode_->itemData(previousMode_).toInt() == int(Mode::AM) &&
             digitalMode_->currentData().toInt() == voiceDmr &&
-            mute_->isChecked() && volume_->value() == 68 && settings().mode == Mode::DigitalVoice;
+            mute_->isChecked() && volume_->value() == 68 && squelch_->isChecked() &&
+            squelchThreshold_->value() == -72.5 && settings().mode == Mode::DigitalVoice;
     }
     bool frontendPersistenceTestState() {
         setFrontendWidgets({false, 3, 31, -42, -2.5});
@@ -747,7 +934,8 @@ public:
     bool frontendRestored() const {
         return settings().frontend == FrontendSettings{false, 3, 31, -42, -2.5} &&
             frontendWidgetValues() == settings().frontend && frontendIf_->isEnabled() &&
-            !frontendSetpoint_->isEnabled();
+            !frontendSetpoint_->isEnabled() && pages_->widget(3)->isAncestorOf(qth_) &&
+            !pages_->widget(0)->isAncestorOf(qth_);
     }
     bool frontendDefaultsRestored() const {
         return settings().frontend.rfReduction == 0;
@@ -782,11 +970,57 @@ public:
         return std::llround(frequency_->value() * 1000000) == 100100000 &&
             mode_->currentData().toInt() == int(Mode::WFM) &&
             digitalMode_->currentData().toInt() == int(DigitalMode::Off) &&
-            !mute_->isChecked() && volume_->value() == 0;
+            !mute_->isChecked() && volume_->value() == 0 && squelch_->isChecked() &&
+            squelchThreshold_->value() == -72.5;
     }
     bool persistenceDefaultsRestored() const {
         return std::llround(frequency_->value() * 1000000) == 7100000 &&
-            digitalMode_->currentData().toInt() == int(DigitalMode::Off);
+            digitalMode_->currentData().toInt() == int(DigitalMode::Off) &&
+            !squelch_->isChecked() && squelchThreshold_->value() == -90;
+    }
+    void setAprsPersistenceTestState() {
+        frequency_->setValue(144.8);
+        digitalMode_->setCurrentIndex(digitalMode_->findData(aprs1200));
+    }
+    bool aprsPersistenceRestored() const {
+        return std::llround(frequency_->value() * 1000000) == 144800000 &&
+            aprsSelected() && settings().mode == Mode::DigitalVoice &&
+            mode_->currentData().toInt() == int(Mode::NFM);
+    }
+    void setCwPersistenceTestState() {
+        digitalMode_->setCurrentIndex(0);
+        frequency_->setValue(7.025);
+        mode_->setCurrentIndex(mode_->findData(int(Mode::CW)));
+        scanMode_->setCurrentIndex(scanMode_->findData(int(Mode::CW)));
+    }
+    bool cwPersistenceRestored() const {
+        return std::llround(frequency_->value() * 1000000) == 7025000 &&
+            settings().mode == Mode::CW && mode_->currentData().toInt() == int(Mode::CW);
+    }
+    bool cwScanTest() const {
+        return scanMode_->currentData().toInt() == int(Mode::CW) &&
+            step_->currentData().toLongLong() == 500 &&
+            pages_->tabText(4) == "Morse CW";
+    }
+    bool cwUiTest() {
+        pages_->setCurrentIndex(4);
+        appendMorseText(QString(11000, 'A'));
+        if (morseText_->toPlainText().size() != 10000) return false;
+        auto *clear = findChild<QPushButton *>("clearMorse");
+        if (!clear) return false;
+        clear->click();
+        return morseText_->toPlainText().isEmpty();
+    }
+    void startCwSmoke() {
+        morseInputBlocks_ = 0;
+        frequency_->setValue(7.025);
+        squelchThreshold_->setValue(0);
+        squelch_->setChecked(true);
+        mode_->setCurrentIndex(mode_->findData(int(Mode::CW)));
+    }
+    bool cwSmokeSucceeded() const {
+        return settings().mode == Mode::CW && morse_ && morse_->isRunning() &&
+            morseInputBlocks_ > 100 && signalSeen_ && squelch_->isChecked();
     }
     void startVoiceSmoke(VoiceMode mode) {
         voiceInputBlocks_ = 0;
@@ -801,6 +1035,14 @@ public:
     bool finishVoiceSmoke() {
         digitalMode_->setCurrentIndex(0);
         return voiceMode() == VoiceMode::Off && mode_->isEnabled() && scanButton_->isEnabled();
+    }
+    void startAprsSmoke() {
+        aprsInputBlocks_ = 0;
+        frequency_->setValue(144.8);
+        digitalMode_->setCurrentIndex(digitalMode_->findData(aprs1200));
+    }
+    bool aprsSmokeSucceeded() const {
+        return aprsSelected() && aprs_ && aprs_->isRunning() && aprsInputBlocks_ > 100 && signalSeen_;
     }
     void startVoiceAdsbSmoke() { adsbUpdates_ = 0; toggleAdsb(); }
     bool stopVoiceAdsbSmoke() {
@@ -905,56 +1147,151 @@ public:
         if (mute_->isChecked() || volume_->value() != volume) return false;
         StationLists reloaded(testListsDirectory_->filePath("lists.json"));
         if (reloaded.lists().size() != 2 || reloaded.lists()[0].stations.size() != 3) return false;
+        auto withPresets = lists_->lists();
+        if (addDefaultLists(withPresets) != 4 || !saveLists(withPresets, withPresets.size() - 1)) return false;
+        stationChoice_->setCurrentIndex(0);
+        if (mainList_->currentText() != "PMR446" || stationChoice_->count() != 16 ||
+            std::llround(frequency_->value() * 1000000) != 446006250 ||
+            Mode(mode_->currentData().toInt()) != Mode::NFM) return false;
+        StationLists withPmrReloaded(testListsDirectory_->filePath("lists.json"));
+        if (withPmrReloaded.lists().size() != 6 ||
+            withPmrReloaded.lists()[5].stations.size() != 16) return false;
         pages_->setCurrentIndex(1);
         return true;
     }
+    bool scanStepTest() {
+        start_->setValue(120.0);
+        scanMode_->setCurrentIndex(scanMode_->findData(int(Mode::AM)));
+        if (step_->currentData().toLongLong() != 8333 ||
+            step_->findData(25000) < 0 ||
+            step_->itemText(step_->findData(8333)) != "8,33 kHz") return false;
+        start_->setValue(1.0);
+        if (step_->currentData().toLongLong() != 9000) return false;
+        start_->setValue(7.0);
+        if (step_->currentData().toLongLong() != 5000) return false;
+
+        scanMode_->setCurrentIndex(scanMode_->findData(int(Mode::NFM)));
+        if (step_->currentData().toLongLong() != 12500 || step_->findData(6250) < 0 ||
+            step_->findData(25000) < 0) return false;
+        scanMode_->setCurrentIndex(scanMode_->findData(int(Mode::WFM)));
+        if (step_->currentData().toLongLong() != 50000 || step_->findData(100000) < 0 ||
+            step_->findData(200000) < 0) return false;
+        start_->setValue(100.1);
+        if (step_->currentData().toLongLong() != 100000) return false;
+        scanMode_->setCurrentIndex(scanMode_->findData(int(Mode::USB)));
+        if (step_->currentData().toLongLong() != 1000) return false;
+        step_->setCurrentIndex(step_->findData(2500));
+        return settings().scanStep == 2500;
+    }
+    bool squelchAprsUiTest() {
+        if (squelch_->isChecked() || !squelchThreshold_->isEnabled()) return false;
+        const double initial = squelchThreshold_->value();
+        const QPointF up(squelchThreshold_->width() - 15, squelchThreshold_->height() / 4);
+        QMouseEvent press(QEvent::MouseButtonPress, up, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent release(QEvent::MouseButtonRelease, up, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(squelchThreshold_, &press);
+        QApplication::sendEvent(squelchThreshold_, &release);
+        if (squelchThreshold_->value() <= initial) return false;
+        auto *line = squelchThreshold_->findChild<QLineEdit *>();
+        if (!line) return false;
+        bool edited = false;
+        QTimer::singleShot(0, [&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!dialog) return;
+            auto *input = dialog->findChild<QLineEdit *>("keyboardInput");
+            auto *accept = dialog->findChild<QPushButton *>("keyboardAccept");
+            if (!input || !accept) { dialog->reject(); return; }
+            input->setText(squelchThreshold_->locale().toString(-73.5, 'f', 1));
+            edited = true;
+            accept->click();
+        });
+        QMouseEvent click(QEvent::MouseButtonRelease, QPointF(2, 2), Qt::LeftButton,
+                          Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(line, &click);
+        if (!edited || squelchThreshold_->value() != -73.5) return false;
+        squelch_->setChecked(true);
+        if (!settings().squelchEnabled || settings().squelchThresholdDbfs != -73.5) return false;
+        digitalMode_->setCurrentIndex(digitalMode_->findData(aprs1200));
+        if (settings().mode != Mode::DigitalVoice || mode_->currentData().toInt() != int(Mode::NFM) ||
+            !squelchThreshold_->isEnabled() || decoderKey(digitalMode_->currentIndex()) != "APRS") return false;
+        addAprsPacket("N0CALL>APRS:>TEST APRS", 144800000);
+        const int row = digitalTable_->rowCount() - 1;
+        if (digitalTable_->item(row, 1)->text() != "APRS" ||
+            digitalTable_->item(row, 2)->text() != "—" ||
+            digitalTable_->item(row, 4)->text() != "N0CALL" ||
+            digitalTable_->item(row, 8)->text() != "N0CALL>APRS:>TEST APRS") return false;
+        digitalMode_->setCurrentIndex(0);
+        return mode_->currentData().toInt() == int(Mode::LSB) && squelch_->isEnabled();
+    }
     bool digitalSortTest() {
+        auto *closeButton = findChild<QPushButton *>("closeButton");
+        if (!closeButton || clearMessages_->parentWidget() != closeButton->parentWidget()) {
+            std::cerr << "Clear button is not beside close\n"; return false;
+        }
+        auto sortByHeader = [this](int column) {
+            digitalTable_->horizontalHeader()->sectionClicked(column);
+        };
         addDigitalMessage({"235959", "CQ K1ABC FN42", "K1ABC", "FN42", -5, 14075500, DigitalMode::FT8});
         addDigitalMessage({"000000", "CQ SP1ABC KO02", "SP1ABC", "KO02", -20, 7075000, DigitalMode::FT8});
         addDigitalMessage({"000001", "SP1ABC K1ABC RR73", "K1ABC", "", -10, 14076000, DigitalMode::FT8});
+        if (digitalTable_->item(0, 0)->text() != "120000" ||
+            digitalTable_->item(1, 0)->text() != "235959" ||
+            sortColumn_ != -1) {
+            std::cerr << "Unsorted initial order incorrect\n"; return false;
+        }
+        sortByHeader(0);
+        sortByHeader(0);
         if (digitalTable_->item(0, 0)->text() != "000001" ||
             digitalTable_->item(1, 0)->text() != "000000" ||
             digitalTable_->item(2, 0)->text() != "235959") {
-            std::cerr << "Newest order incorrect\n"; return false;
+            std::cerr << "Header time sort incorrect\n"; return false;
         }
-        farthest_->click();
+        sortByHeader(7);
+        sortByHeader(7);
         if (digitalTable_->item(0, 6)->text() != "FN42" ||
             digitalTable_->item(3, 7)->text() != "—") {
-            std::cerr << "Farthest order incorrect\n"; return false;
+            std::cerr << "Header distance sort incorrect\n"; return false;
         }
         addDigitalMessage({"000002", "CQ SP2ABC KO02", "SP2ABC", "KO02", -7, 14077000, DigitalMode::FT8});
         if (digitalTable_->item(0, 6)->text() != "FN42" ||
             digitalTable_->item(4, 7)->text() != "—") {
-            std::cerr << "Farthest order after insertion incorrect\n"; return false;
+            std::cerr << "Distance sort after insertion incorrect\n"; return false;
         }
-        newest_->click();
-        if (digitalTable_->item(0, 0)->text() != "000002") { std::cerr << "Newest button failed\n"; return false; }
+        sortByHeader(0);
+        sortByHeader(0);
+        if (digitalTable_->item(0, 0)->text() != "000002") {
+            std::cerr << "Header time resort failed\n"; return false;
+        }
         addDigitalMessage({"000003", "CQ SP3ABC JO90", "SP3ABC", "JO90", -7, 14078000, DigitalMode::FT8});
-        if (digitalTable_->item(0, 0)->text() != "000003") { std::cerr << "Newest insertion failed\n"; return false; }
-        sortColumn_ = 7;
-        sortOrder_ = Qt::AscendingOrder;
-        sortMessages();
+        if (digitalTable_->item(0, 0)->text() != "000003") {
+            std::cerr << "Time sort after insertion failed\n"; return false;
+        }
+        sortByHeader(7);
         if (digitalTable_->item(0, 7)->text() != "0" ||
             digitalTable_->item(1, 7)->text() != "0" ||
             digitalTable_->item(4, 4)->text() != "K1ABC" ||
-            digitalTable_->item(5, 7)->text() != "—") { std::cerr << "Ascending distance failed\n"; return false; }
+            digitalTable_->item(5, 7)->text() != "—") {
+            std::cerr << "Ascending distance failed\n"; return false;
+        }
         addDigitalMessage({"120004", "CQ SP4ABC KO02", "SP4ABC", "KO02", -7, 14077000, DigitalMode::FT8});
         if (digitalTable_->item(0, 7)->text() != "0" || digitalTable_->item(1, 7)->text() != "0" ||
-            digitalTable_->item(6, 7)->text() != "—") { std::cerr << "Ascending insertion failed\n"; return false; }
-        sortColumn_ = 3;
-        sortMessages();
-        if (digitalTable_->item(0, 4)->text() != "SP1ABC") { std::cerr << "Frequency sort failed\n"; return false; }
+            digitalTable_->item(6, 7)->text() != "—") {
+            std::cerr << "Ascending sort after insertion failed\n"; return false;
+        }
+        sortByHeader(3);
+        if (digitalTable_->item(0, 4)->text() != "SP1ABC") {
+            std::cerr << "Header frequency sort failed\n"; return false;
+        }
         savedQth_ = "FN42";
         for (int row = 0; row < digitalTable_->rowCount(); ++row) updateDistance(row);
-        sortColumn_ = 7;
-        sortMessages();
+        sortByHeader(7);
         if (digitalTable_->item(0, 6)->text() != "FN42" || digitalTable_->item(0, 7)->text() != "0")
             { std::cerr << "QTH distance update failed\n"; return false; }
         sortColumn_ = -1;
+        digitalTable_->horizontalHeader()->setSortIndicatorShown(false);
         while (digitalTable_->rowCount() < 2000)
             addDigitalMessage({"120005", "CQ K1ABC FN42", "K1ABC", "FN42", -5, 14075500, DigitalMode::FT8});
-        sortColumn_ = 7;
-        sortMessages();
+        sortByHeader(7);
         addDigitalMessage({"120006", "CQ K1ABC FN42", "K1ABC", "FN42", -5, 14075500, DigitalMode::FT8});
         if (digitalTable_->rowCount() != 2000) { std::cerr << "Table limit failed\n"; return false; }
         for (int row = 0; row < digitalTable_->rowCount(); ++row)
@@ -1124,6 +1461,7 @@ private:
             adsbStatus_->setText("Błąd ADS-B: " + QString::fromUtf8(error.what()));
             return;
         }
+        updateSquelchControls();
         auto *decoder = adsb_;
         connect(decoder, &AdsbDecoder::updated, this, [this, decoder] {
             if (adsb_ != decoder) return;
@@ -1168,6 +1506,7 @@ private:
         }
         auto *decoder = adsb_;
         adsb_ = nullptr;
+        updateSquelchControls();
         disconnect(decoder, nullptr, this, nullptr);
         delete decoder;
         aircraftTable_->setRowCount(0);
@@ -1364,7 +1703,8 @@ private:
         if (!lists_ || scanning_ || mainList_->currentIndex() < 0 || index < 0) return;
         const auto &station = lists_->lists()[mainList_->currentIndex()].stations[index];
         const int modeIndex = mode_->findText(station.mode == "WFM" ? "WFM mono" : station.mode);
-        if (digitalEnabled_ && station.mode != (voiceMode() == VoiceMode::Off ? "USB" : "NFM"))
+        if (digitalEnabled_ && station.mode !=
+            (voiceMode() == VoiceMode::Off && !aprsSelected() ? "USB" : "NFM"))
             digitalMode_->setCurrentIndex(0);
         if (!digitalEnabled_) mode_->setCurrentIndex(modeIndex);
         frequency_->setValue(station.frequencyHz / 1000000.0);
@@ -1377,12 +1717,14 @@ private:
         if (scanning_)
             s.mode = static_cast<Mode>(scanMode_->currentData().toInt());
         else if (digitalMode_->currentData().toInt() != int(DigitalMode::Off))
-            s.mode = voiceMode() == VoiceMode::Off ? Mode::DigitalUSB : Mode::DigitalVoice;
+            s.mode = voiceMode() == VoiceMode::Off && !aprsSelected() ? Mode::DigitalUSB : Mode::DigitalVoice;
         s.scan = scanning_;
         s.scanStart = std::llround(start_->value() * 1000000);
         s.scanEnd = std::llround(end_->value() * 1000000);
-        s.scanStep = std::llround(step_->value() * 1000);
+        s.scanStep = step_->currentData().toLongLong();
         s.threshold = threshold_->value();
+        s.squelchEnabled = squelch_->isChecked();
+        s.squelchThresholdDbfs = squelchThreshold_->value();
         s.scanId = scanId_;
         s.frontend = frontendSettings_;
         return s;
@@ -1411,9 +1753,15 @@ private:
     void applySettings() {
         const auto s = settings();
         const VoiceMode voice = scanning_ ? VoiceMode::Off : voiceMode();
-        if (digital_) digital_->configure(!scanning_ && voice == VoiceMode::Off ?
+        if (digital_) digital_->configure(!scanning_ && voice == VoiceMode::Off && !aprsSelected() ?
                                            DigitalMode(digitalMode_->currentData().toInt()) : DigitalMode::Off,
                                            s.frequency);
+        if (aprs_) aprs_->configure(!scanning_ && !adsb_ && aprsSelected(), s.frequency);
+        if (morse_) {
+            const bool active = !scanning_ && !adsb_ && s.mode == Mode::CW;
+            morse_->configure(active, s.frequency);
+            if (!active) morseStatus_->setText("Wybierz tryb CW na ekranie Odbiornik.");
+        }
         if (voice_ && (voice != appliedVoice_ || (voice != VoiceMode::Off && s.frequency != voiceFrequency_))) {
             voiceAudioTimer_->stop();
             voiceAudio_.clear();
@@ -1434,6 +1782,8 @@ private:
         return mode == voiceDmr ? VoiceMode::DMR : mode == voiceYsf ? VoiceMode::YSF : VoiceMode::Off;
     }
 
+    bool aprsSelected() const { return digitalMode_->currentData().toInt() == aprs1200; }
+
     QString decoderKey(int index) const {
         const QVariant data = digitalMode_->itemData(index);
         if (!data.isValid()) return {};
@@ -1441,6 +1791,7 @@ private:
         if (value == int(DigitalMode::Off)) return "OFF";
         if (value == voiceDmr) return "DMR";
         if (value == voiceYsf) return "YSF";
+        if (value == aprs1200) return "APRS";
         if (value == int(DigitalMode::FT8)) return "FT8";
         if (value == int(DigitalMode::FT4)) return "FT4";
         if (value == int(DigitalMode::WSPR)) return "WSPR";
@@ -1479,6 +1830,19 @@ private:
             if (value == "true" || value == "1") mute_->setChecked(true);
             else if (value == "false" || value == "0") mute_->setChecked(false);
             else invalid << "wyciszenie";
+        }
+        if (settings.contains("squelchEnabled")) {
+            const QString value = settings.value("squelchEnabled").toString().toLower();
+            if (value == "true" || value == "1") squelch_->setChecked(true);
+            else if (value == "false" || value == "0") squelch_->setChecked(false);
+            else invalid << "squelch";
+        }
+        if (settings.contains("squelchThresholdDbfs")) {
+            bool ok = false;
+            const double value = settings.value("squelchThresholdDbfs").toDouble(&ok);
+            if (ok && std::isfinite(value) && value >= -140 && value <= 0)
+                squelchThreshold_->setValue(value);
+            else invalid << "próg squelch";
         }
         if (settings.contains("sdrAgc")) {
             const QString value = settings.value("sdrAgc").toString().toLower();
@@ -1544,6 +1908,8 @@ private:
         settings.setValue("decoder", key);
         settings.setValue("volume", volume_->value());
         settings.setValue("muted", mute_->isChecked());
+        settings.setValue("squelchEnabled", squelch_->isChecked());
+        settings.setValue("squelchThresholdDbfs", squelchThreshold_->value());
         settings.setValue("sdrAgc", frontendSettings_.agc);
         settings.setValue("sdrRfReduction", frontendSettings_.rfReduction);
         settings.setValue("sdrIfReduction", frontendSettings_.ifReduction);
@@ -1601,7 +1967,26 @@ private:
         if (voiceAudio_.isEmpty()) voiceAudioTimer_->stop();
     }
 
-    void addDigitalMessage(const DigitalMessage &message) {
+    void addAprsPacket(const QString &packet, qint64 frequency) {
+        addDigitalMessage({QDateTime::currentDateTimeUtc().toString("HHmmss"), packet,
+                           packet.section('>', 0, 0), {}, 0, double(frequency), DigitalMode::Off}, true);
+    }
+
+    void appendMorseText(const QString &text) {
+        QTextCursor cursor = morseText_->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        cursor.insertText(text);
+        const int excess = morseText_->document()->characterCount() - 1 - 10000;
+        if (excess > 0) {
+            cursor.movePosition(QTextCursor::Start);
+            cursor.movePosition(QTextCursor::Right, QTextCursor::KeepAnchor, excess);
+            cursor.removeSelectedText();
+        }
+        cursor.movePosition(QTextCursor::End);
+        morseText_->setTextCursor(cursor);
+    }
+
+    void addDigitalMessage(const DigitalMessage &message, bool aprs = false) {
         if (digitalTable_->rowCount() >= 2000) {
             int oldest = 0;
             for (int i = 1; i < digitalTable_->rowCount(); ++i)
@@ -1617,9 +2002,10 @@ private:
         auto *time = new NumericItem(message.time);
         time->setData(Qt::UserRole, ++messageSequence_);
         digitalTable_->setItem(row, 0, time);
-        set(1, message.mode == DigitalMode::FT8 ? "FT8" : message.mode == DigitalMode::FT4 ? "FT4" : "WSPR");
-        auto *snr = new NumericItem(QString::number(message.snr));
-        snr->setData(Qt::UserRole, message.snr);
+        set(1, aprs ? "APRS" : message.mode == DigitalMode::FT8 ? "FT8" :
+               message.mode == DigitalMode::FT4 ? "FT4" : "WSPR");
+        auto *snr = new NumericItem(aprs ? "—" : QString::number(message.snr));
+        if (!aprs) snr->setData(Qt::UserRole, message.snr);
         digitalTable_->setItem(row, 2, snr);
         auto *frequency = new NumericItem(QString::number(message.frequencyHz / 1000000.0, 'f', 6));
         frequency->setData(Qt::UserRole, message.frequencyHz);
@@ -1703,6 +2089,28 @@ private:
         previousStation_->setEnabled(!scan && stationChoice_->count() > 0);
         nextStation_->setEnabled(!scan && stationChoice_->count() > 0);
         digitalMode_->setEnabled(!scan && digital_);
+        updateSquelchControls();
+    }
+
+    void updateSquelchControls() {
+        const bool available = !scanning_ && !adsb_ &&
+            digitalMode_->currentData().toInt() == int(DigitalMode::Off);
+        squelch_->setEnabled(available);
+    }
+
+    void updateScanSteps() {
+        const auto mode = static_cast<Mode>(scanMode_->currentData().toInt());
+        const qint64 frequencyHz = std::llround(start_->value() * 1000000);
+        const qint64 recommendedHz = recommendedScanStep(mode, frequencyHz);
+        const QSignalBlocker blocker(step_);
+        step_->clear();
+        int recommendedIndex = -1;
+        for (const auto &option : scanStepOptions(mode)) {
+            step_->addItem(option.second, option.first);
+            if (option.first == recommendedHz) recommendedIndex = step_->count() - 1;
+        }
+        Q_ASSERT(recommendedIndex >= 0);
+        step_->setCurrentIndex(recommendedIndex);
     }
 
     void toggleScan() {
@@ -1732,19 +2140,20 @@ private:
     Receiver *receiver_ = nullptr;
     QAudioOutput *audio_ = nullptr;
     QIODevice *audioDevice_ = nullptr;
-    QDoubleSpinBox *frequency_, *start_, *end_, *step_, *threshold_, *manualFrequency_;
-    QComboBox *mode_, *scanMode_, *manualMode_, *mainList_, *editList_, *stationChoice_;
+    QDoubleSpinBox *frequency_, *start_, *end_, *threshold_, *manualFrequency_, *squelchThreshold_;
+    QComboBox *mode_, *scanMode_, *step_, *manualMode_, *mainList_, *editList_, *stationChoice_;
     QComboBox *frontendAgc_;
     QSpinBox *frontendRf_, *frontendIf_, *frontendSetpoint_;
     QDoubleSpinBox *frontendPpm_;
     QLabel *frontendStatus_;
     FrontendSettings frontendSettings_;
     QSlider *volume_;
+    QCheckBox *squelch_;
     QProgressBar *meter_;
     QLabel *signal_, *status_, *audioStatus_;
     QPushButton *scanButton_, *mute_, *previousStation_, *nextStation_, *newList_, *deleteList_;
     QPushButton *addManual_, *removeStation_, *selectAll_, *deselectAll_, *saveSelected_;
-    QPushButton *newest_, *farthest_, *clearMessages_;
+    QPushButton *clearMessages_;
     QPushButton *adsbStart_, *saveAdsbPosition_;
     QLineEdit *stationName_;
     QLineEdit *adsbLatitude_, *adsbLongitude_;
@@ -1754,12 +2163,17 @@ private:
     QTabWidget *pages_;
     QComboBox *digitalMode_;
     QLineEdit *qth_;
+    QLabel *qthStatus_;
     QLabel *digitalStatus_;
     QLabel *voiceMetadata_;
     QLabel *clockStatus_;
     QLabel *adsbStatus_;
     DigitalDecoder *digital_ = nullptr;
     VoiceDecoder *voice_ = nullptr;
+    AprsDecoder *aprs_ = nullptr;
+    MorseDecoder *morse_ = nullptr;
+    QPlainTextEdit *morseText_;
+    QLabel *morseStatus_;
     QTimer *voiceAudioTimer_ = nullptr;
     QTimer *settingsTimer_ = nullptr;
     QByteArray voiceAudio_;
@@ -1784,8 +2198,8 @@ private:
     int savedDigitalMode_ = 0;
     int aircraftSortColumn_ = 5;
     Qt::SortOrder aircraftSortOrder_ = Qt::AscendingOrder;
-    int sortColumn_ = 0;
-    Qt::SortOrder sortOrder_ = Qt::DescendingOrder;
+    int sortColumn_ = -1;
+    Qt::SortOrder sortOrder_ = Qt::AscendingOrder;
     qint64 messageSequence_ = 0;
     bool scanning_ = false;
     quint64 scanId_ = 0;
@@ -1794,6 +2208,8 @@ private:
     int audioBlocks_ = 0;
     int audioDrops_ = 0;
     int voiceInputBlocks_ = 0;
+    int aprsInputBlocks_ = 0;
+    int morseInputBlocks_ = 0;
 };
 
 int receiverSettingsTest() {
@@ -1826,6 +2242,8 @@ int receiverSettingsTest() {
             settings.value("receiver/decoder").toString() != "DMR" ||
             settings.value("receiver/volume").toInt() != 68 ||
             !settings.value("receiver/muted").toBool() ||
+            !settings.value("receiver/squelchEnabled").toBool() ||
+            settings.value("receiver/squelchThresholdDbfs").toDouble() != -72.5 ||
             settings.value("receiver/sdrAgc").toBool() ||
             settings.value("receiver/sdrRfReduction").toInt() != 3 ||
             settings.value("receiver/sdrIfReduction").toInt() != 31 ||
@@ -1853,13 +2271,35 @@ int receiverSettingsTest() {
             std::cerr << "Frontend defaults were not applied correctly\n";
             return 1;
         }
+        window.setAprsPersistenceTestState();
+    }
+    {
+        Window window(true, false, {}, {}, true);
+        if (!window.aprsPersistenceRestored()) {
+            std::cerr << "APRS receiver settings were not restored\n";
+            return 1;
+        }
+        window.setCwPersistenceTestState();
+        if (!window.cwScanTest()) {
+            std::cerr << "CW controls were not initialized\n";
+            return 1;
+        }
+    }
+    {
+        Window window(true, false, {}, {}, true);
+        if (!window.cwPersistenceRestored()) {
+            std::cerr << "CW receiver settings were not restored\n";
+            return 1;
+        }
     }
     {
         QSettings settings;
         if (settings.value("qth").toString() != "KO02") return 1;
         settings.setValue("receiver/frequencyHz", "invalid");
         settings.setValue("receiver/decoder", "invalid");
+        settings.setValue("receiver/squelchEnabled", "invalid");
         settings.setValue("receiver/sdrRfReduction", 99);
+        settings.setValue("receiver/squelchThresholdDbfs", 999);
         settings.sync();
         if (settings.status() != QSettings::NoError) return 1;
     }
@@ -2320,18 +2760,18 @@ int main(int argc, char **argv) {
         });
         return app.exec();
     }
-    if (args.contains("--install-digital-lists")) {
+    if (args.contains("--install-station-lists") || args.contains("--install-digital-lists")) {
         try {
             const QString path = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
                                      .filePath("listy-czestotliwosci.json");
             StationLists lists(path);
             auto updated = lists.lists();
-            const int count = addDigitalLists(updated);
+            const int count = addDefaultLists(updated);
             if (count) lists.save(updated);
-            std::cout << "Added " << count << " digital lists; existing lists were preserved\n";
+            std::cout << "Added " << count << " preset lists; existing lists were preserved\n";
             return 0;
         } catch (const std::exception &error) {
-            std::cerr << "Cannot install digital lists: " << error.what() << '\n';
+            std::cerr << "Cannot install preset lists: " << error.what() << '\n';
             return 1;
         }
     }
@@ -2468,6 +2908,36 @@ int main(int argc, char **argv) {
         });
         return app.exec();
     }
+    if (args.contains("--aprs-smoke-test")) {
+        Window window(false, true);
+        window.show();
+        window.startAprsSmoke();
+        QTimer::singleShot(6000, &app, [&] {
+            if (!window.aprsSmokeSucceeded()) {
+                std::cerr << "Live IQ-to-APRS decoder test failed\n";
+                app.exit(1);
+            } else {
+                std::cout << "Live IQ reached the APRS decoder; station reception not asserted\n";
+                app.exit(0);
+            }
+        });
+        return app.exec();
+    }
+    if (args.contains("--cw-smoke-test")) {
+        Window window(false, true);
+        window.show();
+        window.startCwSmoke();
+        QTimer::singleShot(6000, &app, [&] {
+            if (!window.cwSmokeSucceeded()) {
+                std::cerr << "Live IQ-to-CW decoder test failed\n";
+                app.exit(1);
+            } else {
+                std::cout << "Live IQ reached the CW decoder with squelch enabled; station reception not asserted\n";
+                app.exit(0);
+            }
+        });
+        return app.exec();
+    }
     if (args.contains("--digital-smoke-test")) {
         Window window(false, true);
         window.show();
@@ -2498,7 +2968,8 @@ int main(int argc, char **argv) {
         return app.exec();
     }
     if (args.contains("--ui-test") || args.contains("--voice-ui-test") || args.contains("--ui-scan-test") || args.contains("--sort-test") ||
-        args.contains("--frontend-ui-test") ||
+        args.contains("--scan-step-test") ||
+        args.contains("--frontend-ui-test") || args.contains("--squelch-aprs-ui-test") || args.contains("--cw-ui-test") ||
         args.contains("--adsb-ui-test")) {
         std::unique_ptr<QTemporaryDir> testSettings;
         if (args.contains("--adsb-ui-test")) {
@@ -2508,6 +2979,10 @@ int main(int argc, char **argv) {
             QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, testSettings->path());
         }
         Window window(true);
+        if (args.contains("--cw-ui-test") && !window.cwUiTest()) {
+            std::cerr << "CW UI history test failed\n";
+            return 1;
+        }
         if (args.contains("--frontend-ui-test")) window.showFrontendUi();
         if (args.contains("--voice-ui-test")) window.voiceUiTest();
         if (args.contains("--adsb-ui-test") && !window.adsbUiTest()) {
@@ -2522,7 +2997,15 @@ int main(int argc, char **argv) {
             std::cerr << "Station list UI test failed\n";
             return 1;
         }
+        if (args.contains("--scan-step-test") && !window.scanStepTest()) {
+            std::cerr << "Scan step selection test failed\n";
+            return 1;
+        }
         window.show();
+        if (args.contains("--squelch-aprs-ui-test") && !window.squelchAprsUiTest()) {
+            std::cerr << "Squelch or APRS UI test failed\n";
+            return 1;
+        }
         QTimer::singleShot(500, &app, [&] {
             const auto screenshot = qEnvironmentVariable("SDR_TOUCH_SCREENSHOT");
             if (!screenshot.isEmpty() && !window.grab().save(screenshot)) {

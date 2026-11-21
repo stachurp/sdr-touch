@@ -14,7 +14,7 @@ struct StationList {
     QVector<Station> stations;
 };
 
-int addDigitalLists(QVector<StationList> &lists);
+int addDefaultLists(QVector<StationList> &lists);
 
 class StationLists {
 public:

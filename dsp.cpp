@@ -15,6 +15,7 @@ std::pair<double, double> passband(Mode mode) {
     case Mode::USB: return {300, 3000};
     case Mode::DigitalUSB: return {200, 4000};
     case Mode::DigitalVoice: return {-7500, 7500};
+    case Mode::CW: return {400, 1000};
     case Mode::AM: return {-5000, 5000};
     case Mode::NFM: return {-6000, 6000};
     case Mode::WFM: return {-90000, 90000};
@@ -122,6 +123,38 @@ bool ScanDetector::detected() const { return complete() && hits_ >= 9; }
 double ScanDetector::level() const {
     if (!detected()) throw std::logic_error("No detected scan signal");
     return peak_;
+}
+
+void SquelchGate::reset() { open_ = false; }
+
+bool SquelchGate::process(std::vector<std::int16_t> &audio, double levelDbfs, double thresholdDbfs) {
+    if (!std::isfinite(levelDbfs) || !std::isfinite(thresholdDbfs))
+        throw std::invalid_argument("Invalid squelch level");
+    const bool wasOpen = open_;
+    if (open_) {
+        if (levelDbfs < thresholdDbfs - 3.0) open_ = false;
+    } else if (levelDbfs >= thresholdDbfs) {
+        open_ = true;
+    }
+
+    if (open_ == wasOpen) {
+        if (!open_) std::fill(audio.begin(), audio.end(), 0);
+        return open_;
+    }
+
+    const std::size_t frames = (audio.size() + 1) / 2;
+    const std::size_t fadeFrames = std::min<std::size_t>(64, frames);
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        const double gain = open_ ?
+            (frame < fadeFrames ? double(frame + 1) / fadeFrames : 1.0) :
+            (frame < fadeFrames ? double(fadeFrames - frame - 1) / fadeFrames : 0.0);
+        for (std::size_t channel = 0; channel < 2; ++channel) {
+            const std::size_t index = frame * 2 + channel;
+            if (index >= audio.size()) break;
+            audio[index] = static_cast<std::int16_t>(std::lround(audio[index] * gain));
+        }
+    }
+    return open_;
 }
 
 WideFm::WideFm() : taps_(161), history_(taps_.size(), 0) {
@@ -241,6 +274,7 @@ void Processor::setMode(Mode mode) {
     case Mode::DigitalUSB: wdspMode = 1; low = 200; high = 4000; break;
     case Mode::NFM: wdspMode = 5; low = -6000; high = 6000; break;
     case Mode::DigitalVoice: break;
+    case Mode::CW: wdspMode = 1; low = 400; high = 1000; break;
     case Mode::AM:
     case Mode::WFM: break;
     }
@@ -255,7 +289,7 @@ SignalBlock Processor::process(const std::vector<std::complex<float>> &samples, 
     if (samples.size() != kBlock || !std::isfinite(shiftHz))
         throw std::invalid_argument("Invalid IQ block");
     std::vector<std::complex<float>> shifted(kBlock);
-    const double step = 2 * pi * shiftHz / kSampleRate;
+    const double step = 2 * pi * (shiftHz + (impl_->mode == Mode::CW ? 700 : 0)) / kSampleRate;
     for (int i = 0; i < kBlock; ++i) {
         const std::complex<float> oscillator(float(std::cos(impl_->phase)), float(std::sin(impl_->phase)));
         shifted[i] = samples[i] * oscillator;

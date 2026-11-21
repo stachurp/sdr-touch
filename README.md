@@ -1,6 +1,6 @@
 # SDR Touch
 
-Prototyp odbiornika i skanera dla SDRplay RSP1 na Raspberry Pi z dekodowaniem FT8, FT4, WSPR, DMR, Yaesu System Fusion i ADS-B.
+Prototyp odbiornika i skanera dla SDRplay RSP1 na Raspberry Pi z dekodowaniem FT8, FT4, WSPR, DMR, Yaesu System Fusion, APRS i ADS-B.
 Nie obsługuje nadawania. Program korzysta z SoapySDR z modułem SDRplay, WDSP, FFTW3f, Qt 5 i ICU,
 a do dekodowania i informacji o krajach także z pakietów `wsjtx`, `iso-codes` i `fonts-noto-color-emoji`.
 
@@ -32,7 +32,7 @@ Polecenie pozostaje uruchomione do zamknięcia okna. Przed startem zamknij inne 
 korzystające z RSP1. Jeśli używasz innej sesji graficznej, dostosuj zmienne środowiskowe.
 
 Do próby odsłuchu ustaw znaną częstotliwość lokalnej stacji radiowej i wybierz **WFM mono**.
-Sprawdź antenę i wyjście dźwięku w ustawieniach pulpitu. Dostępne są również AM, NFM, LSB i USB.
+Sprawdź antenę i wyjście dźwięku w ustawieniach pulpitu. Dostępne są również AM, NFM, LSB, USB i CW.
 Zakres przestrajania wynosi 10 kHz–2 GHz; nie oznacza to jednakowej czułości w całym zakresie.
 WFM ma 50 µs de-emfazy, jest monofoniczne i nie dekoduje RDS.
 
@@ -43,7 +43,22 @@ głośność i stan wyciszenia. Są zapisywane lokalnie; ADS-B nie uruchamia si�
 Wskaźnik pokazuje szczyt FFT w paśmie odbioru, a nie potwierdzenie obecności transmisji FT8.
 Wybierz zapisaną listę i częstotliwość lub użyj przycisków ◀ / ▶, aby przełączać pozycje.
 Razem z częstotliwością ustawiana jest jej modulacja. Pozycja z inną modulacją niż wymagana
-przez aktywny dekoder (USB dla FT8/FT4/WSPR, NFM dla DMR/YSF) wyłącza dekoder.
+przez aktywny dekoder (USB dla FT8/FT4/WSPR, NFM dla DMR/YSF/APRS) wyłącza dekoder.
+Przycisk **Wyczyść wyniki** obok **Zamknij** usuwa po potwierdzeniu bieżące wiadomości cyfrowe.
+Opcjonalny **Squelch** na ekranie **Odbiornik** wycisza analogowe audio poniżej ustawionego
+progu dBFS. Jest domyślnie wyłączony; próg dobierz do wskazania poziomu sygnału.
+Próg można ustawić także przed zaznaczeniem pola **Squelch**.
+Nie zmienia progu wykrywania skanera ani pracy dekoderów cyfrowych.
+
+## CW i Morse
+
+Wybierz **CW** i dostrój częstotliwość do nośnej sygnału. W głośniku słychać ton
+około 700 Hz, a w zakładce **Morse CW** pojawia się automatycznie rozpoznany tekst.
+**Wyczyść tekst CW** usuwa bieżącą historię. Dekodowanie działa również przy wyciszeniu
+i zamkniętym squelchu, a na czas skanowania lub ADS-B jest wstrzymywane.
+Wymaga `multimon-ng` z dekoderem `MORSE_CW`; błędy są widoczne na ekranie.
+Rozpoznawanie jest przybliżone: zakłócenia, słaby sygnał i nieregularne tempo mogą
+powodować błędy. Wybór CW jest dostępny również w skanerze i listach częstotliwości.
 
 Dotknięcie edytowalnego pola tekstowego lub liczbowego otwiera klawiaturę ekranową.
 Pola liczbowe pokazują cyfry oraz potrzebne znaki, takie jak separator dziesiętny i minus.
@@ -60,8 +75,12 @@ skalę wskazań dBFS, dlatego po jej zmianie może wymagać korekty także próg
 
 ## Skanowanie i listy
 
-W zakładce **Skanowanie i listy** ustaw modulację, początek, koniec, krok i próg, a następnie
-naciśnij **Rozpocznij skanowanie**.
+W zakładce **Skanowanie i listy** ustaw modulację, początek, koniec i próg, a następnie
+naciśnij **Rozpocznij skanowanie**. Krok wybiera się z listy dopasowanej do modulacji;
+po zmianie modulacji lub częstotliwości początkowej ustawiany jest odpowiedni krok domyślny.
+Domyślne siatki to m.in. 9 kHz dla fal średnich AM, 5 kHz dla krótkofalowego AM,
+8,33 kHz dla pasma lotniczego AM, 12,5 kHz dla NFM i 100 kHz dla UKF WFM.
+Krok można zmienić ręcznie na inną wartość z listy.
 Skan przebiega jednokrotnie, z oczekiwaniem 250 ms na krok (400 ms dla WFM) plus czas
 pomiarów i przestrajania. Jeden tuner oznacza,
 że odsłuch jest wstrzymany na czas skanowania. **Zatrzymaj skanowanie** przywraca odsłuch.
@@ -88,10 +107,15 @@ i opcjonalną nazwę albo usunąć zaznaczoną pozycję. Powtórzona częstotliw
 modulacją nie jest dodawana ponownie. Usunięcie listy wymaga potwierdzenia.
 Listy są zapisywane lokalnie w `~/.local/share/SDRTouch/SDRTouch/listy-czestotliwosci.json`;
 istniejący plik CSV pozostaje osobną historią wyników, nie jest automatycznie listą.
-Przygotowano listy **Cyfrowe FT8**, **Cyfrowe FT4** i **Cyfrowe WSPR** z częstotliwościami
-dial USB dla popularnych pasm, zgodnie z domyślną tabelą WSJT-X. Listy służą do ręcznego
-przełączania; po wybraniu pozycji ustaw odpowiedni **Dekoder**. Skaner nie dekoduje
-automatycznie kolejnych częstotliwości. Niektóre pasma zależą od anteny i propagacji.
+Domyślne listy dodaje się po zbudowaniu programu poleceniem
+`~/sdr-touch/build/sdr-touch --install-station-lists`. Dodawane są tylko brakujące listy;
+istniejące listy i ich zawartość pozostają bez zmian. Starsze polecenie
+`--install-digital-lists` nadal działa.
+Zestaw zawiera **Cyfrowe FT8**, **Cyfrowe FT4** i **Cyfrowe WSPR** z częstotliwościami
+dial USB dla popularnych pasm, zgodnie z domyślną tabelą WSJT-X, oraz kanały **PMR446**.
+Listy służą do ręcznego przełączania; po wybraniu pozycji ustaw odpowiedni **Dekoder**.
+Skaner nie dekoduje automatycznie kolejnych częstotliwości. Niektóre pasma zależą od anteny
+i propagacji.
 
 ## FT8, FT4 i WSPR
 
@@ -100,18 +124,20 @@ Ustaw częstotliwość dial odpowiednią dla pasma i emisji, np. 14,074 MHz dla 
 **Dekoder**. Program automatycznie używa szerokiego filtra USB; po wyłączeniu dekodera
 przywraca poprzedni tryb. Skanowanie i dekodowanie wzajemnie się wykluczają.
 
-W polu **Mój lokator** wpisz własny lokator Maidenhead (4, 6 lub 8 znaków) i naciśnij
-**Zapisz QTH**. Jest zapisywany lokalnie. Puste pole usuwa zapisany lokator.
-W zakładce **Wiadomości cyfrowe** widać odczytane wiadomości, znak, flagę i polską nazwę
-kraju lub obszaru oraz odległość. Odległość jest przybliżona: liczona między środkami
-lokatorów i dostępna tylko, gdy wiadomość zawiera lokator stacji. Flaga i nazwa wynikają
-z prefiksu znaku, nie są potwierdzeniem fizycznego położenia. Nierozpoznane wartości
+W zakładce **Ustawienia SDR**, w sekcji **Pozycja i lokator**, wpisz własny lokator
+Maidenhead (4, 6 lub 8 znaków) i naciśnij **Zapisz QTH**. Jest zapisywany lokalnie.
+Puste pole usuwa zapisany lokator.
+W tabeli **Wiadomości cyfrowe** na ekranie **Odbiornik** widać odczytane wiadomości, znak,
+flagę i polską nazwę kraju lub obszaru oraz odległość. Odległość jest przybliżona i liczona
+między środkami lokatorów; jest dostępna tylko, gdy wiadomość zawiera lokator stacji.
+Flaga i nazwa wynikają z prefiksu znaku, nie są potwierdzeniem fizycznego położenia.
+Nierozpoznane wartości
 oznaczono `—`. Tabela wiadomości nie jest zapisywana po zamknięciu programu.
-Przyciski **Najnowsze** i **Najdalsze** ustawiają sortowanie automatycznie utrzymywane
-po nadejściu kolejnych wiadomości; domyślnie najnowsze dekodowania są na górze.
-Odległość wymaga obu lokatorów, a wiadomości bez niej są na końcu również przy wyborze
-**Najdalsze**. Dotknięcie nagłówka kolumny sortuje wyniki; kolejne zmienia kierunek.
-Odległości, poziomy SNR i częstotliwości sortowane są liczbowo. **Wyczyść wyniki**
+Początkowo wiadomości są w kolejności odbioru. Dotknięcie nagłówka kolumny sortuje wyniki;
+kolejne dotknięcie zmienia kierunek. Po rozpoczęciu sortowania nowe wiadomości zachowują
+wybrany porządek. Odległość wymaga
+obu lokatorów, a wiadomości bez niej trafiają na koniec. Odległości, poziomy SNR
+i częstotliwości sortowane są liczbowo. **Wyczyść wyniki**
 po potwierdzeniu usuwa wiadomości cyfrowe z bieżącej sesji, bez usuwania list
 częstotliwości ani historii skanowania. Nowo odebrane wiadomości pojawią się ponownie.
 
@@ -163,6 +189,22 @@ cmake -S ~/sdr-touch-dsd-fme -B ~/sdr-touch-dsd-fme/build -DCMAKE_BUILD_TYPE=Rel
   -DMBE_LIBRARY="$HOME/sdr-touch-mbelib/build/libmbe.a" -DMBE_INCLUDE_DIR="$HOME/sdr-touch-mbelib"
 cmake --build ~/sdr-touch-dsd-fme/build -j 4
 ```
+
+## PMR446
+
+Lista **PMR446** zawiera 16 kanałów analogowego PMR446, od 446,00625 MHz do 446,19375 MHz
+w odstępach 12,5 kHz. Wybierz listę na ekranie **Odbiornik** i kanał; aplikacja ustawi
+częstotliwość oraz modulację **NFM**. Odbiornik nie obsługuje nadawania, tonów CTCSS/DCS
+ani cyfrowego dPMR446.
+
+## APRS
+
+Ustaw częstotliwość 144,800 MHz (standardowa częstotliwość APRS w Europie) i wybierz
+**APRS 1200** w polu **Dekoder**. Odebrane pakiety AFSK 1200 pojawiają się w tabeli
+wiadomości cyfrowych w postaci tekstu TNC2. Inne prędkości i mapa nie są obsługiwane.
+Odsłuch sygnału modemowego jest wyciszony; squelch nie wpływa na dekodowanie.
+APRS wymaga programu `multimon-ng` dostępnego w PATH, np. `sudo apt install multimon-ng`.
+Dekodowanie jest lokalne, bez wysyłania danych do sieci i bez nadawania.
 
 ## Samoloty ADS-B
 

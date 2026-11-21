@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/arrows">
+        <file alias="down.xpm">down-arrow.xpm</file>
+        <file alias="up.xpm">up-arrow.xpm</file>
+    </qresource>
+</RCC>
