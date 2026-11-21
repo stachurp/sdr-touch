@@ -4,6 +4,18 @@ Prototyp odbiornika i skanera dla SDRplay RSP1 na Raspberry Pi z dekodowaniem FT
 Nie obsługuje nadawania. Program korzysta z SoapySDR z modułem SDRplay, WDSP, FFTW3f, Qt 5 i ICU,
 a do dekodowania i informacji o krajach także z pakietów `wsjtx`, `iso-codes` i `fonts-noto-color-emoji`.
 
+## Zrzuty ekranu
+
+Zrzuty przedstawiają interfejs z danymi testowymi, nie rzeczywisty odbiór.
+
+| Odbiornik | Skanowanie i listy |
+| --- | --- |
+| ![Ekran odbiornika](docs/screenshots/receiver.png) | ![Skanowanie i listy](docs/screenshots/scan.png) |
+| **Samoloty ADS-B** | **Ustawienia SDR** |
+| ![Samoloty ADS-B](docs/screenshots/adsb.png) | ![Ustawienia SDR](docs/screenshots/settings.png) |
+| **Morse CW** | |
+| ![Dekoder Morse CW](docs/screenshots/morse.png) | |
+
 ## Uruchomienie
 
 Na tej instalacji uruchom **SDR Touch** ikoną na pulpicie lub z menu aplikacji.
