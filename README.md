@@ -13,8 +13,8 @@ Zrzuty przedstawiają interfejs z danymi testowymi, nie rzeczywisty odbiór.
 | ![Ekran odbiornika](docs/screenshots/receiver.png) | ![Skanowanie i listy](docs/screenshots/scan.png) |
 | **Samoloty ADS-B** | **Ustawienia SDR** |
 | ![Samoloty ADS-B](docs/screenshots/adsb.png) | ![Ustawienia SDR](docs/screenshots/settings.png) |
-| **Morse CW** | |
-| ![Dekoder Morse CW](docs/screenshots/morse.png) | |
+| **Morse CW** | **Dekodery cyfrowe** |
+| ![Dekoder Morse CW](docs/screenshots/morse.png) | ![Dekodery cyfrowe](docs/screenshots/digital.png) |
 
 ## Uruchomienie
 
@@ -54,6 +54,11 @@ naciśnięcie przywraca ustawioną głośność. Odbiór, wskaźnik poziomu i de
 Po ponownym uruchomieniu przywracane są ostatnia częstotliwość, modulacja, wybrany dekoder,
 głośność i stan wyciszenia. Są zapisywane lokalnie; ADS-B nie uruchamia się automatycznie.
 Wskaźnik pokazuje szczyt FFT w paśmie odbioru, a nie potwierdzenie obecności transmisji FT8.
+Widmo i wodospad pokazują około 200 kHz pasma wejściowego. Oś podaje częstotliwość
+w MHz, a żółta linia oznacza częstotliwość odbioru. Dotknięcie wykresu lub wodospadu
+dostraja odbiornik do wskazanego miejsca. Po dostrojeniu historia wodospadu jest
+czyszczona; widmo jest wstrzymywane podczas skanowania i pracy ADS-B. Poziomy są
+przybliżone, zależne od wzmocnienia i nie są pomiarem dBm.
 Wybierz zapisaną listę i częstotliwość lub użyj przycisków ◀ / ▶, aby przełączać pozycje.
 Razem z częstotliwością ustawiana jest jej modulacja. Pozycja z inną modulacją niż wymagana
 przez aktywny dekoder (USB dla FT8/FT4/WSPR, NFM dla DMR/YSF/APRS) wyłącza dekoder.
@@ -133,14 +138,14 @@ i propagacji.
 ## FT8, FT4 i WSPR
 
 Ustaw częstotliwość dial odpowiednią dla pasma i emisji, np. 14,074 MHz dla FT8,
-14,080 MHz dla FT4 albo 14,0956 MHz dla WSPR w paśmie 20 m. Wybierz emisję w polu
-**Dekoder**. Program automatycznie używa szerokiego filtra USB; po wyłączeniu dekodera
+14,080 MHz dla FT4 albo 14,0956 MHz dla WSPR w paśmie 20 m. W zakładce **Dekodery cyfrowe**
+wybierz emisję w polu **Dekoder**. Program automatycznie używa szerokiego filtra USB; po wyłączeniu dekodera
 przywraca poprzedni tryb. Skanowanie i dekodowanie wzajemnie się wykluczają.
 
 W zakładce **Ustawienia SDR**, w sekcji **Pozycja i lokator**, wpisz własny lokator
 Maidenhead (4, 6 lub 8 znaków) i naciśnij **Zapisz QTH**. Jest zapisywany lokalnie.
 Puste pole usuwa zapisany lokator.
-W tabeli **Wiadomości cyfrowe** na ekranie **Odbiornik** widać odczytane wiadomości, znak,
+W tabeli **Wiadomości cyfrowe** w zakładce **Dekodery cyfrowe** widać odczytane wiadomości, znak,
 flagę i polską nazwę kraju lub obszaru oraz odległość. Odległość jest przybliżona i liczona
 między środkami lokatorów; jest dostępna tylko, gdy wiadomość zawiera lokator stacji.
 Flaga i nazwa wynikają z prefiksu znaku, nie są potwierdzeniem fizycznego położenia.
@@ -163,8 +168,8 @@ lokalnie przez programy WSJT-X; aplikacja nie wysyła wyników do sieci. Mapy je
 
 ## DMR i C4FM (Yaesu System Fusion)
 
-Na ekranie **Odbiornik** ustaw częstotliwość i wybierz **DMR** lub **C4FM (YSF)**
-w polu **Dekoder**. Program automatycznie używa toru NFM odpowiedniego dla danych
+Na ekranie **Odbiornik** ustaw częstotliwość, a w zakładce **Dekodery cyfrowe** wybierz
+**DMR** lub **C4FM (YSF)** w polu **Dekoder**. Program automatycznie używa toru NFM odpowiedniego dla danych
 cyfrowych; po wyłączeniu dekodera przywraca poprzedni tryb. Odtwarzana jest tylko
 nieszyfrowana mowa; **Wycisz** nie wyłącza dekodowania. Jeśli dane są dostępne, pod
 wyborem dekodera pojawia się color code, slot, identyfikator celu i źródła DMR albo
@@ -212,12 +217,107 @@ ani cyfrowego dPMR446.
 
 ## APRS
 
-Ustaw częstotliwość 144,800 MHz (standardowa częstotliwość APRS w Europie) i wybierz
-**APRS 1200** w polu **Dekoder**. Odebrane pakiety AFSK 1200 pojawiają się w tabeli
+Ustaw częstotliwość 144,800 MHz (standardowa częstotliwość APRS w Europie) i w zakładce
+**Dekodery cyfrowe** wybierz **APRS 1200** w polu **Dekoder**. Odebrane pakiety AFSK 1200 pojawiają się w tabeli
 wiadomości cyfrowych w postaci tekstu TNC2. Inne prędkości i mapa nie są obsługiwane.
 Odsłuch sygnału modemowego jest wyciszony; squelch nie wpływa na dekodowanie.
 APRS wymaga programu `multimon-ng` dostępnego w PATH, np. `sudo apt install multimon-ng`.
 Dekodowanie jest lokalne, bez wysyłania danych do sieci i bez nadawania.
+
+## Sondy meteorologiczne
+
+Zapisz pozycję w zakładce **Samoloty ADS-B**, następnie otwórz zakładkę **Sondy**.
+Lista odświeża się co minutę, gdy zakładka jest otwarta; można też użyć przycisku
+**Odśwież sondy**. Lista zawiera ostatnio zgłoszone sondy w promieniu
+500 km według danych SondeHub z ostatnich 30 minut. Odległość nie gwarantuje
+odbioru: znaczenie mają wysokość sondy, antena i przeszkody. Pozycja ADS-B
+pozostaje lokalna; aplikacja pobiera publiczną listę bez wysyłania współrzędnych.
+Dotknięcie sondy dowolnego typu przełącza RSP1 na jej ostatnio zgłoszoną
+częstotliwość NFM i umożliwia odsłuch sygnału. Głośność i wyciszenie są wspólne
+z ekranem odbiornika; sprawdź także ustawienie squelcha. Na mapie niebieski punkt
+oznacza zapisaną pozycję użytkownika, czerwony ostatnią pozycję sondy z SondeHub,
+a zielony ostatnią pozycję odebraną lokalnie. Gdy pozycje się pokrywają, zielony
+znacznik jest widoczny jako obwódka. Miejsce startu wybranej sondy pochodzi
+z przypisania SondeHub i może być nieznane lub niedokładne.
+Tabela podaje odległość i czas ostatniego zgłoszenia UTC, nie gwarantując bieżącej
+pozycji ani odbioru. Automatyczne odświeżenie nie przestraja odbiornika: dotknij
+sondy ponownie, jeśli zmieniła częstotliwość.
+
+Mapa pobiera kafelki OpenStreetMap przez internet: dostawca widzi adres IP oraz
+przybliżony wyświetlany obszar. Współrzędne ADS-B nie są wysyłane do SondeHub.
+Przyciski **+** i **−** zmieniają powiększenie, przeciągnięcie przesuwa mapę,
+a **⌂** ponownie dopasowuje widok do sondy i zapisanej pozycji. Odświeżanie
+pozycji zachowuje ręcznie ustawiony widok.
+
+Opcjonalnie dla wybranej RS41, M10 lub M20 naciśnij **Dekoduj sondę**. Lokalna telemetria
+pojawia się pod listą, a **Zatrzymaj dekodowanie** kończy dekodowanie. Licznik
+obejmuje ramki zgłoszone przez dekoder dla danej sondy od uruchomienia aplikacji,
+także ponownie odebrane; nie liczy ramek innych sond. Ostatnie dane i czas ich
+odbioru są przechowywane tylko w bieżącej sesji. Panel pokazuje wartości z ostatniej
+ramki; brakujące pola są oznaczone „—”. Współrzędne i odległość zachowują ostatnią
+poprawną lokalną pozycję, a **Pozycja UTC** wskazuje czas jej odbioru.
+Pozostałe typy można odsłuchiwać, ale ich dekodowanie nie jest obsługiwane.
+RS41 i M20 są dekodowane bezpośrednio z próbek IQ, niezależnie od toru odsłuchu;
+M10 korzysta z demodulowanego audio.
+Ten sam tuner jest współdzielony z innymi dekoderami; wyniki zależą od sygnału i
+aktualności częstotliwości. Dane z SondeHub i telemetria lokalna są niezależne;
+aplikacja nie wysyła telemetrii do SondeHub.
+
+RS41, M10 i M20 wymagają dekoderów `rs41mod`, `m10mod` i `m10m20mod`. Na Raspberry Pi
+z kompilatorem GCC:
+
+```sh
+git clone https://github.com/rs1729/RS.git ~/sdr-touch-rs
+git -C ~/sdr-touch-rs checkout ce448555d34da5ca01f1a526e838c4f7be464481
+cd ~/sdr-touch-rs/demod/mod
+gcc -O2 rs41mod.c demod_mod.c bch_ecc_mod.c -lm -o rs41mod
+gcc -O2 m10mod.c demod_mod.c -lm -o m10mod
+gcc -O2 m10m20mod.c demod_mod.c -lm -o m10m20mod
+```
+
+Po zainstalowaniu dekoderów ponownie skonfiguruj projekt przez CMake, aby dołączyć
+testy dekodowania syntetycznych sygnałów M10 i M20 do CTest.
+
+## Zdjęcia Meteor-M LRPT
+
+Funkcja działa w osobnej zakładce **Meteor-M** i wymaga zapisanego lokatora Maidenhead
+(4, 6 lub 8 znaków) w **Ustawieniach SDR**. Przycisk **Odśwież przeloty** pobiera
+publiczne elementy orbitalne satelitów Meteor-M z CelesTrak i pokazuje przeloty
+z elewacją co najmniej 10° w ciągu następnych 24 godzin. Obliczenia wykonuje lokalnie
+pakiet SGP4; lokator nie jest wysyłany do CelesTrak.
+
+Wybierz przelot, częstotliwość i szybkość symbolową niezależnie, a następnie naciśnij
+**Nagraj wybrany przelot**. Aplikacja pokazuje ostatnią częstotliwość potwierdzoną
+przez odbiór społeczności SatNOGS (za pośrednictwem OrbitNight), wraz z wiekiem
+obserwacji i stacją odbiorczą; odczyty starsze niż 24 godziny są oznaczone jako nieaktualne.
+To wskazówka, nie gwarancja — operator może zmienić częstotliwość, więc sprawdź też
+widmo przed przelotem. SatNOGS nie raportuje szybkości symbolowej w tych obserwacjach:
+zacznij od **72 ksym/s**, a jeśli demodulator nie zsynchronizuje sygnału, spróbuj
+**80 ksym/s**. Przed nagrywaniem użyj **Test odsłuchu**: aplikacja przestraja na
+wybraną częstotliwość w WFM i tymczasowo włącza dźwięk; przybliżony szczyt FFT
+pojawia się w statusie. Na czas testu squelch jest wyłączany, a poprzednie ustawienia
+odbiornika są przywracane po jego zakończeniu. Test pomaga sprawdzić strojenie i
+obecność sygnału, ale nie potwierdza synchronizacji LRPT.
+Nagrywanie rozpocznie się o przewidywanym początku przelotu,
+zatrzyma się po jego końcu lub po 12 minutach. RSP1 ma jeden tuner;
+podczas nagrania dźwięk jest wyciszony, a skanowanie i inne dekodery są wstrzymane. Nagranie CS16
+przy 384 kS/s zajmuje około 1,54 MB/s (do 1,11 GB). Po zakończeniu SatDump dekoduje
+plik, a największy znaleziony obraz jest wyświetlany w zakładce. Pliki IQ i produkty
+pozostają lokalnie w `~/.local/share/SDRTouch/SDRTouch/meteor-m/`.
+
+Na Raspberry Pi z Debianem wymagane są pakiety:
+
+```sh
+sudo apt install satdump python3-sgp4
+```
+
+Wymagane jest połączenie internetowe do pobierania elementów orbitalnych i
+ostatnich obserwacji częstotliwości. Jeśli źródło obserwacji jest niedostępne,
+częstotliwość można wybrać ręcznie. Prognoza zależy od aktualności elementów
+orbitalnych i czasu systemowego; odbiór obrazu wymaga odpowiedniej
+anteny na pasmo 137 MHz i widoczności nieba. Brak obrazu może oznaczać słaby sygnał,
+zakłócenia lub nieprawidłową częstotliwość. Ta funkcja dekoduje LRPT z Meteor-M,
+nie analogowe zdjęcia NOAA APT.
 
 ## Samoloty ADS-B
 

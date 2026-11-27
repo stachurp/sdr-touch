@@ -97,6 +97,53 @@ double spectrumPeakDbfs(const std::vector<std::complex<float>> &samples, double 
     return spectrumLevels(samples, lowHz, highHz).peakDbfs;
 }
 
+struct SpectrumAnalyzer::Impl {
+    fftwf_complex *input = nullptr;
+    fftwf_complex *output = nullptr;
+    fftwf_plan plan = nullptr;
+    double windowSum = 0;
+    std::vector<float> window;
+    Impl() : window(kBlock) {
+        input = fftwf_alloc_complex(kBlock);
+        output = fftwf_alloc_complex(kBlock);
+        if (input && output) plan = fftwf_plan_dft_1d(kBlock, input, output, FFTW_FORWARD, FFTW_ESTIMATE);
+        if (!plan) {
+            fftwf_free(input);
+            fftwf_free(output);
+            throw std::runtime_error("Nie można zainicjować FFT widma");
+        }
+        for (int i = 0; i < kBlock; ++i) {
+            window[i] = float(0.5 - 0.5 * std::cos(2 * pi * i / (kBlock - 1)));
+            windowSum += window[i];
+        }
+    }
+    ~Impl() {
+        fftwf_destroy_plan(plan);
+        fftwf_free(input);
+        fftwf_free(output);
+    }
+};
+
+SpectrumAnalyzer::SpectrumAnalyzer() : impl_(std::make_unique<Impl>()) {}
+SpectrumAnalyzer::~SpectrumAnalyzer() = default;
+
+std::vector<float> SpectrumAnalyzer::process(const std::vector<std::complex<float>> &samples) {
+    if (samples.size() != kBlock) throw std::invalid_argument("Invalid spectrum input");
+    for (int i = 0; i < kBlock; ++i) {
+        impl_->input[i][0] = samples[i].real() * impl_->window[i];
+        impl_->input[i][1] = samples[i].imag() * impl_->window[i];
+    }
+    fftwf_execute(impl_->plan);
+    std::vector<float> result(kBlock);
+    const double scale = impl_->windowSum * impl_->windowSum;
+    for (int i = 0; i < kBlock; ++i) {
+        const int bin = (i + kBlock / 2) % kBlock;
+        const double real = impl_->output[bin][0], imag = impl_->output[bin][1];
+        result[i] = float(10 * std::log10(std::max((real * real + imag * imag) / scale, 1e-20)));
+    }
+    return result;
+}
+
 void ScanDetector::reset() {
     blocks_ = hits_ = 0;
     peak_ = -200;

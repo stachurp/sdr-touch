@@ -5,7 +5,9 @@
 #include <SoapySDR/Formats.hpp>
 #include <SoapySDR/Constants.h>
 #include <QDateTime>
+#include <QFile>
 #include <QMutexLocker>
+#include <QtEndian>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -41,6 +43,9 @@ void validate(const ReceiverSettings &s) {
     if (!std::isfinite(s.squelchThresholdDbfs) ||
         s.squelchThresholdDbfs < -140 || s.squelchThresholdDbfs > 0)
         throw std::invalid_argument("Nieprawidlowy prog squelch");
+    if (s.meteorIq && (s.meteorCapturePath.isEmpty() || s.scan || s.sondeIq ||
+                       s.mode != Mode::WFM))
+        throw std::invalid_argument("Nieprawidlowa sciezka lub tryb nagrywania LRPT");
     const auto &f = s.frontend;
     if (f.rfReduction < 0 || f.rfReduction > 3 || f.ifReduction < 20 || f.ifReduction > 59 ||
         f.agcSetpoint < -60 || f.agcSetpoint > 0 || !std::isfinite(f.ppm) || std::abs(f.ppm) > 100)
@@ -116,7 +121,9 @@ void Receiver::run() {
         if (rc != 0) throw std::runtime_error(std::string("Nie mozna uruchomic strumienia: ") + SoapySDR_errToStr(rc));
         stream.active = true;
         Processor processor;
+        SpectrumAnalyzer spectrum;
         ReceiverSettings current;
+        QFile meteorCapture;
         std::uint64_t revision = 0;
         std::int64_t frequency = 0;
         double shift = 0;
@@ -132,6 +139,7 @@ void Receiver::run() {
         auto tunedAt = std::chrono::steady_clock::now();
         auto lastLevel = tunedAt;
         auto lastBlock = tunedAt;
+        auto lastSpectrum = tunedAt;
         auto tune = [&](std::int64_t target) {
             std::int64_t offset = current.mode == Mode::WFM ? 0 : 24000;
             if (target + offset > maxHz) offset = -offset;
@@ -183,6 +191,8 @@ void Receiver::run() {
                 validate(requested);
                 const bool tuningChanged = revision == 0 || !sameTuning(current, requested);
                 const bool frontendChanged = revision == 0 || current.frontend != requested.frontend;
+                const bool captureChanged = current.meteorIq != requested.meteorIq ||
+                    current.meteorCapturePath != requested.meteorCapturePath;
                 const bool squelchChanged = revision == 0 ||
                     current.squelchEnabled != requested.squelchEnabled ||
                     current.squelchThresholdDbfs != requested.squelchThresholdDbfs;
@@ -190,6 +200,23 @@ void Receiver::run() {
                 revision = newRevision;
                 if (frontendChanged) applyFrontend(current.frontend);
                 if (squelchChanged) squelch.reset();
+                if (captureChanged) {
+                    if (meteorCapture.isOpen()) {
+                        if (!meteorCapture.flush())
+                            throw std::runtime_error("Nie mozna zapisac pliku IQ Meteor-M");
+                        const QString path = meteorCapture.fileName();
+                        meteorCapture.close();
+                        emit meteorCaptureStopped(path);
+                    }
+                    if (current.meteorIq) {
+                        meteorCapture.setFileName(current.meteorCapturePath);
+                        if (!meteorCapture.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                            throw std::runtime_error(
+                                QString("Nie mozna utworzyc pliku IQ: %1")
+                                    .arg(meteorCapture.errorString()).toStdString());
+                        emit meteorCaptureStarted(current.frequency);
+                    }
+                }
                 if (!tuningChanged) continue;
                 processor.setMode(current.mode);
                 scanning = current.scan;
@@ -231,6 +258,24 @@ void Receiver::run() {
             filled += count;
             if (filled < kBlock) continue;
             filled = 0;
+            if (current.meteorIq && meteorCapture.isOpen()) {
+                QByteArray block(int(samples.size() * 2 * sizeof(qint16)), Qt::Uninitialized);
+                auto *output = block.data();
+                for (const auto &sample : samples) {
+                    const auto scale = [](float value) {
+                        const float bounded = std::clamp(value, -1.0f, 1.0f);
+                        return qint16(std::lround(bounded * 32767.0f));
+                    };
+                    qToLittleEndian(scale(sample.real()), output);
+                    output += sizeof(qint16);
+                    qToLittleEndian(scale(sample.imag()), output);
+                    output += sizeof(qint16);
+                }
+                if (meteorCapture.write(block) != block.size())
+                    throw std::runtime_error(
+                        QString("Blad zapisu pliku IQ Meteor-M: %1")
+                            .arg(meteorCapture.errorString()).toStdString());
+            }
             auto now = std::chrono::steady_clock::now();
             if (now - lastBlock >= std::chrono::milliseconds(100)) {
                 emit blockReceived();
@@ -238,11 +283,22 @@ void Receiver::run() {
             }
             if (scanning && now - tunedAt <
                 std::chrono::milliseconds(current.mode == Mode::WFM ? 400 : 250)) continue;
+            if (!scanning && spectrumEnabled_ && now - tunedAt >= std::chrono::milliseconds(200) &&
+                now - lastSpectrum >= std::chrono::milliseconds(100) &&
+                !spectrumPending_.exchange(true)) {
+                const auto bins = spectrum.process(samples);
+                emit spectrumReady(QVector<float>(bins.begin(), bins.end()), frequency + qint64(shift), frequency);
+                lastSpectrum = now;
+            }
             const bool reportLevel = scanning || now - lastLevel >= std::chrono::milliseconds(200);
             const bool squelchActive = current.squelchEnabled &&
                 current.mode != Mode::DigitalUSB && current.mode != Mode::DigitalVoice;
             const bool measure = reportLevel || (!scanning && squelchActive);
             const qint64 captureEndMs = QDateTime::currentMSecsSinceEpoch();
+            if (!scanning && current.sondeIq)
+                emit sondeIqReady(QByteArray(reinterpret_cast<const char *>(samples.data()),
+                                             int(samples.size() * sizeof(samples[0]))),
+                                  current.frequency, shift);
             auto result = processor.process(samples, shift, measure);
             if (reportLevel) {
                 emit signalLevel(result.peakDbfs);
@@ -279,6 +335,13 @@ void Receiver::run() {
             } else {
                 tune(frequency + current.scanStep);
             }
+        }
+        if (meteorCapture.isOpen()) {
+            if (!meteorCapture.flush())
+                throw std::runtime_error("Nie mozna zapisac pliku IQ Meteor-M");
+            const QString path = meteorCapture.fileName();
+            meteorCapture.close();
+            emit meteorCaptureStopped(path);
         }
     } catch (const std::exception &error) {
         emit failed(QString::fromUtf8(error.what()));

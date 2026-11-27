@@ -67,6 +67,18 @@ private:
 double spectrumPeakDbfs(const std::vector<std::complex<float>> &samples, double lowHz, double highHz);
 SpectrumLevels spectrumLevels(const std::vector<std::complex<float>> &samples, double lowHz, double highHz);
 
+class SpectrumAnalyzer {
+public:
+    SpectrumAnalyzer();
+    ~SpectrumAnalyzer();
+    SpectrumAnalyzer(const SpectrumAnalyzer &) = delete;
+    SpectrumAnalyzer &operator=(const SpectrumAnalyzer &) = delete;
+    std::vector<float> process(const std::vector<std::complex<float>> &samples);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class WideFm {
 public:
     WideFm();

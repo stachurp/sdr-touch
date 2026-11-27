@@ -3,7 +3,9 @@
 #include "dsp.hpp"
 #include <QByteArray>
 #include <QMutex>
+#include <QString>
 #include <QThread>
+#include <QVector>
 #include <atomic>
 #include <cstdint>
 
@@ -30,6 +32,9 @@ struct ReceiverSettings {
     double threshold = -60;
     bool squelchEnabled = false;
     double squelchThresholdDbfs = -90;
+    bool sondeIq = false;
+    bool meteorIq = false;
+    QString meteorCapturePath;
     quint64 scanId = 0;
     FrontendSettings frontend;
 };
@@ -40,6 +45,8 @@ public:
     explicit Receiver(QString resultPath, QObject *parent = nullptr);
     ~Receiver() override;
     void configure(const ReceiverSettings &settings);
+    void setSpectrumEnabled(bool enabled) { spectrumEnabled_ = enabled; }
+    void acknowledgeSpectrum() { spectrumPending_ = false; }
     void restart();
     void stop();
 
@@ -47,6 +54,9 @@ signals:
     void statusChanged(const QString &status);
     void failed(const QString &message);
     void audioReady(const QByteArray &pcm, qint64 captureEndMs, qint64 frequency, int mode);
+    void sondeIqReady(const QByteArray &iq, qint64 frequency, double shiftHz);
+    void meteorCaptureStarted(qint64 frequency);
+    void meteorCaptureStopped(const QString &path);
     void morseAudioReady(const QByteArray &pcm, qint64 frequency);
     void audioGap();
     void signalLevel(double dbfs);
@@ -54,6 +64,7 @@ signals:
     void scanFinished(quint64 scanId);
     void blockReceived();
     void frontendApplied();
+    void spectrumReady(const QVector<float> &levels, qint64 center, qint64 tunedFrequency);
 
 protected:
     void run() override;
@@ -64,4 +75,6 @@ private:
     ReceiverSettings settings_;
     std::uint64_t revision_ = 1;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> spectrumEnabled_{false};
+    std::atomic<bool> spectrumPending_{false};
 };

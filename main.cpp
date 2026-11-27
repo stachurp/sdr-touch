@@ -7,6 +7,9 @@
 #include "voice.hpp"
 #include "aprs.hpp"
 #include "morse.hpp"
+#include "spectrum_widget.hpp"
+#include "sonde.hpp"
+#include "sonde_map.hpp"
 #include <QAbstractButton>
 #include <QApplication>
 #include <QAudioDeviceInfo>
@@ -19,6 +22,7 @@
 #include <QDoubleSpinBox>
 #include <QDoubleValidator>
 #include <QDialog>
+#include <QDirIterator>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
@@ -27,12 +31,19 @@
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QInputDialog>
+#include <QImageReader>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QList>
 #include <QProcess>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QPair>
@@ -41,6 +52,7 @@
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSettings>
+#include <QStorageInfo>
 #include <QStandardPaths>
 #include <QSpinBox>
 #include <QTableWidget>
@@ -50,7 +62,9 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QUrlQuery>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <limits>
 
@@ -58,6 +72,9 @@ namespace {
 constexpr int voiceDmr = 100;
 constexpr int voiceYsf = 101;
 constexpr int aprs1200 = 102;
+constexpr int sondeRs41 = 103;
+constexpr int sondeM10 = 104;
+constexpr int sondeM20 = 105;
 QString dataFile() {
     return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("sygnaly.csv");
 }
@@ -156,6 +173,28 @@ public:
     }
 };
 
+struct LocalSondeReception {
+    quint64 frames = 0;
+    QJsonObject data;
+    std::optional<Location> position;
+    QDateTime received;
+    QDateTime positionReceived;
+};
+
+struct MeteorPass {
+    QString satellite;
+    QDateTime start;
+    QDateTime maximum;
+    QDateTime end;
+    double maximumElevation = 0;
+};
+
+struct MeteorFrequencyObservation {
+    qint64 frequencyHz = 0;
+    qint64 ageSeconds = -1;
+    QString station;
+};
+
 class Window : public QWidget {
 public:
     explicit Window(bool test = false, bool mute = false, QString adsbExecutable = {}, QString voiceExecutable = {},
@@ -216,11 +255,20 @@ public:
         auto *frontendLayout = new QVBoxLayout(frontendPage);
         auto *morsePage = new QWidget;
         auto *morseLayout = new QVBoxLayout(morsePage);
+        auto *digitalPage = new QWidget;
+        auto *digitalLayout = new QVBoxLayout(digitalPage);
+        auto *sondePage = new QWidget;
+        auto *sondeLayout = new QVBoxLayout(sondePage);
+        auto *meteorPage = new QWidget;
+        auto *meteorLayout = new QVBoxLayout(meteorPage);
         pages_->addTab(home, "Odbiornik");
         pages_->addTab(scanPage, "Skanowanie i listy");
         pages_->addTab(adsbPage, "Samoloty ADS-B");
         pages_->addTab(frontendPage, "Ustawienia SDR");
         pages_->addTab(morsePage, "Morse CW");
+        pages_->addTab(digitalPage, "Dekodery cyfrowe");
+        pages_->addTab(sondePage, "Sondy");
+        pages_->addTab(meteorPage, "Meteor-M");
         root->addWidget(pages_, 1);
         morseStatus_ = new QLabel("Wybierz tryb CW na ekranie Odbiornik.");
         morseText_ = new QPlainTextEdit;
@@ -405,6 +453,9 @@ public:
         digitalMode_->addItem("DMR", voiceDmr);
         digitalMode_->addItem("C4FM (YSF)", voiceYsf);
         digitalMode_->addItem("APRS 1200", aprs1200);
+        digitalMode_->addItem("Sonda RS41", sondeRs41);
+        digitalMode_->addItem("Sonda M10", sondeM10);
+        digitalMode_->addItem("Sonda M20", sondeM20);
         digitalControls->addWidget(new QLabel("Dekoder"));
         digitalControls->addWidget(digitalMode_);
         clockStatus_ = new QLabel("NTP: sprawdzanie");
@@ -412,11 +463,18 @@ public:
         digitalStatus_ = new QLabel("Dekodowanie wyłączone");
         digitalStatus_->setWordWrap(true);
         digitalControls->addWidget(digitalStatus_, 1);
-        receiverLayout->addLayout(digitalControls);
+        digitalLayout->addLayout(digitalControls);
         homeLayout->addWidget(receiverPanel);
+        spectrum_ = new SpectrumWidget;
+        spectrum_->setToolTip("Dotknij widma lub wodospadu, aby dostroić częstotliwość.");
+        homeLayout->addWidget(spectrum_, 1);
+        connect(spectrum_, &SpectrumWidget::frequencySelected, this, [this](qint64 frequency) {
+            if (!scanning_ && !adsb_ && frequency_->isEnabled())
+                frequency_->setValue(frequency / 1000000.0);
+        });
         voiceMetadata_ = new QLabel("Brak danych");
         voiceMetadata_->setVisible(false);
-        homeLayout->addWidget(voiceMetadata_);
+        digitalLayout->addWidget(voiceMetadata_);
         digitalTable_ = new QTableWidget(0, 9);
         digitalTable_->setHorizontalHeaderLabels({"UTC", "Tryb", "SNR", "MHz", "Znak", "Kraj / obszar",
                                                   "Lokator", "km", "Wiadomość"});
@@ -446,7 +504,7 @@ public:
         });
         auto *messagesTitle = new QLabel("Wiadomości cyfrowe");
         messagesTitle->setObjectName("sectionTitle");
-        homeLayout->addWidget(messagesTitle);
+        digitalLayout->addWidget(messagesTitle);
         clearMessages_ = new QPushButton("Wyczyść wyniki");
         connect(clearMessages_, &QPushButton::clicked, this, [this] {
             if (digitalTable_->rowCount() == 0) return;
@@ -455,7 +513,160 @@ public:
                     QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes)
                 digitalTable_->setRowCount(0);
         });
-        homeLayout->addWidget(digitalTable_, 1);
+        digitalLayout->addWidget(digitalTable_, 1);
+        auto *sondeControls = new QHBoxLayout;
+        auto *refreshSondes = new QPushButton("Odśwież sondy");
+        auto *receiveSonde = new QPushButton("Dekoduj sondę");
+        auto *stopSonde = new QPushButton("Zatrzymaj dekodowanie");
+        refreshSondes->setObjectName("refreshSondes");
+        receiveSonde->setObjectName("receiveSonde");
+        stopSonde->setObjectName("stopSonde");
+        sondeControls->addWidget(refreshSondes);
+        sondeControls->addWidget(receiveSonde);
+        sondeControls->addWidget(stopSonde);
+        sondeLayout->addLayout(sondeControls);
+        sondeStatus_ = new QLabel("SondeHub: odśwież listę (pozycja ADS-B, promień 500 km).");
+        sondeStatus_->setWordWrap(true);
+        sondeLayout->addWidget(sondeStatus_);
+        sondeTable_ = new QTableWidget(0, 6);
+        sondeTable_->setHorizontalHeaderLabels({"Sonda", "Typ", "MHz", "km", "Wys. m", "UTC"});
+        sondeTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+        const int sondeColumnWidths[] = {75, 55, 110, 50, 70, 85};
+        for (int i = 0; i < 6; ++i) sondeTable_->setColumnWidth(i, sondeColumnWidths[i]);
+        sondeTable_->verticalHeader()->hide();
+        sondeTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        sondeTable_->setSelectionMode(QAbstractItemView::SingleSelection);
+        sondeTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        auto *sondeContent = new QHBoxLayout;
+        sondeContent->addWidget(sondeTable_, 1);
+        sondeMap_ = new SondeMap(!test);
+        sondeContent->addWidget(sondeMap_, 1);
+        sondeLayout->addLayout(sondeContent, 1);
+        auto *sondeAudio = new QHBoxLayout;
+        auto *sondeVolume = new QSlider(Qt::Horizontal);
+        sondeVolume->setRange(0, 100);
+        sondeVolume->setValue(volume_->value());
+        auto *sondeMute = new QPushButton("Wycisz");
+        sondeMute->setCheckable(true);
+        sondeMute->setChecked(mute_->isChecked());
+        sondeAudio->addWidget(new QLabel("Głośność"));
+        sondeAudio->addWidget(sondeVolume, 1);
+        sondeAudio->addWidget(sondeMute);
+        sondeLayout->addLayout(sondeAudio);
+        connect(sondeVolume, &QSlider::valueChanged, volume_, &QSlider::setValue);
+        connect(volume_, &QSlider::valueChanged, sondeVolume, &QSlider::setValue);
+        connect(sondeMute, &QPushButton::toggled, mute_, &QPushButton::setChecked);
+        connect(mute_, &QPushButton::toggled, sondeMute, &QPushButton::setChecked);
+        connect(sondeMute, &QPushButton::toggled, sondeMute, [sondeMute](bool muted) {
+            sondeMute->setText(muted ? "Włącz dźwięk" : "Wycisz");
+        });
+        auto *sondeInfo = new QHBoxLayout;
+        sondeLaunch_ = new QLabel("Start: wybierz sondę.");
+        sondeLaunch_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        sondeFrames_ = new QLabel("Lokalne ramki: 0");
+        sondeInfo->addWidget(sondeLaunch_, 1);
+        sondeInfo->addWidget(sondeFrames_);
+        sondeLayout->addLayout(sondeInfo);
+        auto *sondeTelemetry = new QGridLayout;
+        sondeTelemetry->setContentsMargins(2, 2, 2, 2);
+        sondeTelemetry->setHorizontalSpacing(8);
+        sondeTelemetry->setVerticalSpacing(2);
+        const QStringList telemetryLabels = {
+            "Sonda", "Ramka", "Odbiór UTC", "Pozycja UTC",
+            "Szerokość", "Długość", "Wysokość", "Odległość",
+            "Prędkość", "Wznoszenie", "Temperatura", "Wilgotność",
+            "Ciśnienie", "Kierunek", "Bateria", "Satelity"
+        };
+        for (int i = 0; i < telemetryLabels.size(); ++i) {
+            auto *label = new QLabel(telemetryLabels[i] + ": —");
+            label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            sondeTelemetryFields_.append(label);
+            sondeTelemetry->addWidget(label, i / 4, i % 4);
+            sondeTelemetry->setColumnStretch(i % 4, 1);
+        }
+        sondeLayout->addLayout(sondeTelemetry);
+        auto *meteorControls = new QGridLayout;
+        meteorPassChoice_ = new QComboBox;
+        meteorPassChoice_->setObjectName("meteorPassChoice");
+        meteorRefresh_ = new QPushButton("Odśwież przeloty");
+        meteorRefresh_->setObjectName("meteorRefresh");
+        meteorFrequency_ = new QComboBox;
+        meteorFrequency_->setObjectName("meteorFrequency");
+        meteorFrequency_->addItem("137,100 MHz", qint64(137100000));
+        meteorFrequency_->addItem("137,900 MHz", qint64(137900000));
+        meteorFrequency_->setCurrentIndex(1);
+        meteorRate_ = new QComboBox;
+        meteorRate_->setObjectName("meteorRate");
+        meteorRate_->addItem("72 ksym/s", "meteor_m2-x_lrpt");
+        meteorRate_->addItem("80 ksym/s", "meteor_m2-x_lrpt_80k");
+        meteorListenTest_ = new QPushButton("Test odsłuchu");
+        meteorListenTest_->setObjectName("meteorListenTest");
+        meteorListenTest_->setToolTip(
+            "Przestraja na częstotliwość LRPT, tymczasowo włącza dźwięk i wyłącza squelch. Test nie potwierdza synchronizacji.");
+        meteorRecord_ = new QPushButton("Nagraj wybrany przelot");
+        meteorRecord_->setObjectName("meteorRecord");
+        meteorRecommendation_ = new QLabel(
+            "Częstotliwość nie jest raportowana przez prognozę przelotów.");
+        meteorRecommendation_->setObjectName("meteorRecommendation");
+        meteorRecommendation_->setWordWrap(true);
+        meteorUseRecommendation_ = new QPushButton("Użyj zalecanej");
+        meteorUseRecommendation_->setObjectName("meteorUseRecommendation");
+        meteorUseRecommendation_->setEnabled(false);
+        meteorControls->addWidget(new QLabel("Przelot (następne 24 h)"), 0, 0);
+        meteorControls->addWidget(meteorPassChoice_, 0, 1, 1, 2);
+        meteorControls->addWidget(meteorRefresh_, 0, 3);
+        meteorControls->addWidget(new QLabel("Częstotliwość LRPT"), 1, 0);
+        meteorControls->addWidget(meteorFrequency_, 1, 1);
+        meteorControls->addWidget(new QLabel("Szybkość symbolowa"), 1, 2);
+        meteorControls->addWidget(meteorRate_, 1, 3);
+        meteorControls->addWidget(meteorListenTest_, 2, 0);
+        meteorControls->addWidget(meteorRecord_, 2, 1, 1, 3);
+        meteorLayout->addLayout(meteorControls);
+        auto *meteorRecommendationLayout = new QHBoxLayout;
+        meteorRecommendationLayout->addWidget(meteorRecommendation_, 1);
+        meteorRecommendationLayout->addWidget(meteorUseRecommendation_);
+        meteorLayout->addLayout(meteorRecommendationLayout);
+        meteorStatus_ = new QLabel(
+            "Wymaga zapisanego QTH. Nagranie obejmuje wybrany przelot i kończy się automatycznie.");
+        meteorStatus_->setObjectName("meteorStatus");
+        meteorStatus_->setWordWrap(true);
+        meteorLayout->addWidget(meteorStatus_);
+        meteorImage_ = new QLabel("Po dekodowaniu obraz Meteor-M pojawi się tutaj.");
+        meteorImage_->setObjectName("meteorImage");
+        meteorImage_->setAlignment(Qt::AlignCenter);
+        meteorImage_->setMinimumSize(320, 212);
+        meteorImage_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        meteorImage_->setStyleSheet("QLabel { background: #11161a; border: 1px solid #39424b; }");
+        meteorLayout->addWidget(meteorImage_, 1);
+        auto *meteorNote = new QLabel(
+            "Nagranie IQ CS16, 384 kS/s (około 1,54 MB/s), maksymalnie 12 minut. "
+            "Wymaga SatDump i połączenia internetowego do pobrania elementów orbitalnych.");
+        meteorNote->setWordWrap(true);
+        meteorLayout->addWidget(meteorNote);
+        sondeNetwork_ = new QNetworkAccessManager(this);
+        connect(refreshSondes, &QPushButton::clicked, this, [this] { refreshSondeList(); });
+        connect(sondeTable_, &QTableWidget::cellClicked, this, [this, test](int row, int) {
+            selectSonde(row, test);
+        });
+        connect(receiveSonde, &QPushButton::clicked, this, [this, test] {
+            const int row = sondeTable_->currentRow();
+            if (row < 0) { sondeStatus_->setText("Wybierz sondę z listy."); return; }
+            const auto type = sondeTable_->item(row, 1)->text();
+            if (type != "RS41" && type != "M10" && type != "M20") {
+                sondeStatus_->setText("Obsługiwane jest dekodowanie sond RS41, M10 i M20.");
+                return;
+            }
+            if (adsb_ || scanning_ || (!test && (!receiver_ || !receiver_->isRunning()))) {
+                sondeStatus_->setText("Odbiornik jest niedostępny lub skanowanie trwa.");
+                return;
+            }
+            selectSonde(row, test);
+            const int decoder = type == "RS41" ? sondeRs41 : type == "M20" ? sondeM20 : sondeM10;
+            digitalMode_->setCurrentIndex(digitalMode_->findData(decoder));
+        });
+        connect(stopSonde, &QPushButton::clicked, this, [this] {
+            if (sondeSelected()) digitalMode_->setCurrentIndex(0);
+        });
         auto *listControls = new QHBoxLayout;
         editList_ = new QComboBox;
         editList_->setPlaceholderText("Utwórz listę");
@@ -576,17 +787,58 @@ public:
         settingsTimer_->setSingleShot(true);
         settingsTimer_->setInterval(500);
         connect(settingsTimer_, &QTimer::timeout, this, [this] { saveReceiverSettings(); });
+        meteorPassProcess_ = new QProcess(this);
+        connect(meteorPassProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                this, [this](int code, QProcess::ExitStatus exitStatus) {
+            meteorPassRequestFinished(code, exitStatus);
+        });
+        connect(meteorPassProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+            if (error == QProcess::FailedToStart) {
+                meteorRefresh_->setEnabled(true);
+                meteorStatus_->setText("Nie można uruchomić python3 do prognozowania przelotów.");
+            }
+        });
+        meteorDecodeProcess_ = new QProcess(this);
+        connect(meteorDecodeProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                this, [this](int code, QProcess::ExitStatus exitStatus) {
+            meteorDecodeFinished(code, exitStatus);
+        });
+        connect(meteorDecodeProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+            if (error == QProcess::FailedToStart) {
+                meteorRecord_->setEnabled(true);
+                meteorRefresh_->setEnabled(!meteorRecording_ && !meteorArmed_);
+                meteorStatus_->setText("Nie można uruchomić SatDump. Zainstaluj pakiet satdump.");
+            }
+        });
+        meteorStartTimer_ = new QTimer(this);
+        meteorStartTimer_->setSingleShot(true);
+        connect(meteorStartTimer_, &QTimer::timeout, this, [this] {
+            if (meteorArmed_) startMeteorRecording(meteorScheduledPass_);
+        });
+        meteorStopTimer_ = new QTimer(this);
+        meteorStopTimer_->setSingleShot(true);
+        connect(meteorStopTimer_, &QTimer::timeout, this, [this] { stopMeteorRecording(); });
         const int restoredDigital = persistSettings_ ? restoreReceiverSettings() : 0;
         updateSquelchControls();
         connect(closeButton, &QPushButton::clicked, this, &QWidget::close);
+        connect(meteorRefresh_, &QPushButton::clicked, this, [this] { refreshMeteorPasses(); });
+        connect(meteorRecord_, &QPushButton::clicked, this, [this] { toggleMeteorRecording(); });
+        connect(meteorListenTest_, &QPushButton::clicked, this, [this] { toggleMeteorListenTest(); });
+        connect(meteorPassChoice_, qOverload<int>(&QComboBox::currentIndexChanged),
+                this, [this] { updateMeteorRecommendation(); });
+        connect(meteorUseRecommendation_, &QPushButton::clicked, this, [this] {
+            const int index = meteorFrequency_->findData(meteorRecommendedFrequencyHz_);
+            if (index >= 0) meteorFrequency_->setCurrentIndex(index);
+        });
         connect(mute_, &QPushButton::toggled, this, [this](bool muted) {
             mute_->setText(muted ? "Włącz dźwięk" : "Wycisz");
-            if (audio_) audio_->setVolume(muted || adsb_ ? 0 : volume_->value() / 100.0);
+            if (audio_) audio_->setVolume(muted || adsb_ || meteorRecording_ ? 0 : volume_->value() / 100.0);
             scheduleReceiverSettings();
         });
         mute_->setText(mute_->isChecked() ? "Włącz dźwięk" : "Wycisz");
         connect(volume_, &QSlider::valueChanged, this, [this](int value) {
-            if (audio_ && !mute_->isChecked() && !adsb_) audio_->setVolume(value / 100.0);
+            if (audio_ && !mute_->isChecked() && !adsb_ && !meteorRecording_)
+                audio_->setVolume(value / 100.0);
             scheduleReceiverSettings();
         });
         connect(squelch_, &QCheckBox::toggled, this, [this] {
@@ -599,10 +851,12 @@ public:
             scheduleReceiverSettings();
         });
         connect(frequency_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] {
+            spectrum_->clear("Oczekiwanie na próbki po dostrojeniu");
             applySettings();
             scheduleReceiverSettings();
         });
         connect(mode_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+            spectrum_->clear("Oczekiwanie na próbki po zmianie trybu");
             applySettings();
             if (!digitalEnabled_ && digitalMode_->currentData().toInt() == int(DigitalMode::Off))
                 scheduleReceiverSettings();
@@ -622,7 +876,7 @@ public:
                 mode_->setCurrentIndex(previousMode_);
             }
             if (enabled) mode_->setCurrentIndex(mode_->findData(int(
-                voiceMode() == VoiceMode::Off && !aprsSelected() ? Mode::USB : Mode::NFM)));
+                voiceMode() == VoiceMode::Off && !aprsSelected() && !sondeSelected() ? Mode::USB : Mode::NFM)));
             digitalEnabled_ = enabled;
             updateSquelchControls();
             voiceMetadata_->setVisible(voiceMode() != VoiceMode::Off);
@@ -630,8 +884,21 @@ public:
             scanButton_->setEnabled(!enabled && receiver_ && receiver_->isRunning());
             applySettings();
             if (!adsb_) scheduleReceiverSettings();
-            if (enabled) pages_->setCurrentIndex(0);
         });
+        connect(pages_, &QTabWidget::currentChanged, this, [this, test](int index) {
+            if (receiver_) receiver_->setSpectrumEnabled(index == 0 && !scanning_ && !adsb_);
+            if (!test && index == 6 && adsbQth_ && !sondeReply_ && sondeCandidates_.isEmpty())
+                refreshSondeList();
+            if (!test && index == 7 && meteorPassChoice_->count() == 0 &&
+                meteorPassProcess_->state() == QProcess::NotRunning)
+                refreshMeteorPasses();
+        });
+        auto *sondeRefreshTimer = new QTimer(this);
+        sondeRefreshTimer->setInterval(60000);
+        connect(sondeRefreshTimer, &QTimer::timeout, this, [this] {
+            if (pages_->currentIndex() == 6 && adsbQth_ && !sondeReply_) refreshSondeList();
+        });
+        if (!test) sondeRefreshTimer->start();
         setupAdsbPosition(test);
         setupLists(test);
         if (test) {
@@ -672,6 +939,14 @@ public:
         }
         voice_ = new VoiceDecoder(this, std::move(voiceExecutable));
         aprs_ = new AprsDecoder(this);
+        sonde_ = new SondeDecoder(this);
+        connect(sonde_, &SondeDecoder::telemetry, this, [this](const QString &text) {
+            receiveSondeTelemetry(text);
+        });
+        connect(sonde_, &SondeDecoder::failed, this, [this](const QString &message) {
+            if (sondeSelected()) digitalMode_->setCurrentIndex(0);
+            sondeStatus_->setText(message);
+        });
         connect(aprs_, &AprsDecoder::statusChanged, digitalStatus_, &QLabel::setText);
         connect(aprs_, &AprsDecoder::failed, this, [this](const QString &message) {
             digitalMode_->setCurrentIndex(0);
@@ -766,16 +1041,31 @@ public:
                 audioStatus_->setText("Wyjście audio: " + device.deviceName());
         }
         receiver_ = new Receiver(dataFile(), this);
+        qRegisterMetaType<QVector<float>>("QVector<float>");
+        connect(receiver_, &Receiver::spectrumReady, this,
+                [this](const QVector<float> &levels, qint64 center, qint64 frequency) {
+            receiver_->acknowledgeSpectrum();
+            const auto desired = settings();
+            qint64 offset = desired.mode == Mode::WFM ? 0 : 24000;
+            if (frequency + offset > 2000000000) offset = -offset;
+            if (!adsb_ && !scanning_ && pages_->currentIndex() == 0 &&
+                desired.frequency == frequency && center == frequency + offset) {
+                spectrum_->setFrame(levels, center, frequency);
+                ++spectrumFrames_;
+            }
+        });
         connect(receiver_, &Receiver::frontendApplied, this, [this] {
             frontendStatus_->setText("Ustawienia przekazano do sterownika SDRplay.");
         });
         connect(receiver_, &Receiver::statusChanged, status_, &QLabel::setText);
         connect(receiver_, &Receiver::blockReceived, this, [this] { if (!adsb_) receivedIq_ = true; });
         connect(receiver_, &Receiver::audioGap, this, [this] {
+            spectrum_->clear("Oczekiwanie na próbki po przerwie");
             if (digital_ && !adsb_) digital_->resetCapture();
             if (voice_ && !adsb_) voice_->gap();
             if (aprs_ && !adsb_) aprs_->gap();
             if (morse_ && !adsb_) morse_->gap();
+            if (sonde_ && !adsb_) sonde_->gap();
         });
         connect(receiver_, &Receiver::morseAudioReady, this, [this](const QByteArray &pcm, qint64 frequency) {
             const auto desired = settings();
@@ -790,6 +1080,15 @@ public:
             if (std::isfinite(level)) {
                 meter_->setValue(int(std::lround(level)));
                 signalSeen_ = true;
+                if (meteorPreviewing_) {
+                    const QString volumeWarning = volume_->value() == 0
+                        ? "Głośność 0%; " : QString();
+                    meteorStatus_->setText(
+                        QString("Test: %1%2 MHz WFM; szczyt FFT %3 dBFS; synchronizacja LRPT niepotwierdzona.")
+                            .arg(volumeWarning)
+                            .arg(frequency_->value(), 0, 'f', 4)
+                            .arg(level, 0, 'f', 1));
+                }
             }
         });
         connect(receiver_, &Receiver::failed, this, [this](const QString &message) {
@@ -800,13 +1099,52 @@ public:
             mode_->setEnabled(false);
             digitalMode_->setEnabled(false);
             adsbStart_->setEnabled(false);
+            if (audio_ && meteorRecording_)
+                audio_->setVolume(mute_->isChecked() ? 0 : volume_->value() / 100.0);
+            meteorArmed_ = false;
+            meteorRecording_ = false;
+            if (meteorPreviewing_) {
+                meteorPreviewing_ = false;
+                meteorListenTest_->setText("Test odsłuchu");
+                mute_->setChecked(meteorPreviewRestoreMuted_);
+                squelch_->setChecked(meteorPreviewRestoreSquelch_);
+            }
+            if (meteorStartTimer_) meteorStartTimer_->stop();
+            if (meteorStopTimer_) meteorStopTimer_->stop();
+            meteorStatus_->setText("Błąd odbiornika podczas pracy Meteor-M: " + message);
+            meteorRecord_->setEnabled(false);
             status_->setText("Błąd odbiornika: " + message);
             QMessageBox::critical(this, "Błąd odbiornika", message);
+        });
+        connect(receiver_, &Receiver::meteorCaptureStarted, this, [this](qint64 frequency) {
+            if (meteorClosing_ || !meteorRecording_) return;
+            const qint64 remaining = QDateTime::currentDateTimeUtc().msecsTo(meteorScheduledPass_.end);
+            const int duration = int(std::clamp<qint64>(remaining, 1, 12 * 60 * 1000));
+            meteorStopTimer_->start(duration);
+            meteorStatus_->setText(QString("Nagrywanie LRPT %1 MHz do %2 UTC lub maksymalnie 12 min.")
+                .arg(frequency / 1000000.0, 0, 'f', 1)
+                .arg(meteorScheduledPass_.end.toString("HH:mm:ss")));
+        });
+        connect(receiver_, &Receiver::meteorCaptureStopped, this, [this](const QString &path) {
+            if (meteorClosing_) return;
+            meteorStopTimer_->stop();
+            meteorRecording_ = false;
+            meteorArmed_ = false;
+            if (audio_) audio_->setVolume(mute_->isChecked() ? 0 : volume_->value() / 100.0);
+            setMeteorBusyUi(false);
+            restoreMeteorReceiverSettings();
+            meteorStatus_->setText("Nagranie zakończone. Przygotowanie dekodowania SatDump...");
+            decodeMeteorRecording(path);
         });
         connect(receiver_, &Receiver::audioReady, this, [this](const QByteArray &pcm, qint64 timestamp, qint64 frequency, int mode) {
             if (adsb_) return;
             const auto desired = settings();
             if (frequency != desired.frequency || mode != int(desired.mode)) return;
+            if (sondeSelected()) {
+                if (sonde_ && !scanning_ && sondeType() == SondeType::M10) sonde_->feed(pcm);
+                if (!scanning_) playAudio(pcm);
+                return;
+            }
             if (voiceMode() != VoiceMode::Off) {
                 if (voice_ && !scanning_) {
                     voice_->feed(pcm);
@@ -823,6 +1161,12 @@ public:
             }
             if (digital_ && !scanning_) digital_->feed(pcm, timestamp);
             if (!scanning_) playAudio(pcm);
+        });
+        connect(receiver_, &Receiver::sondeIqReady, this, [this](const QByteArray &iq, qint64 frequency, double shiftHz) {
+            if (!sonde_ || adsb_ || scanning_ || !sondeSelected() || sondeType() == SondeType::M10 ||
+                frequency != settings().frequency) return;
+            if (!sonde_->isActive()) sonde_->start(frequency, sondeType(), shiftHz);
+            sonde_->feedIq(iq);
         });
         connect(receiver_, &Receiver::detected, this, [this](quint64 scanId, qint64 freq, double level, const QString &mode) {
             receiveScanDetection(scanId, freq, level, mode);
@@ -860,6 +1204,15 @@ public:
     }
 
     ~Window() override {
+        meteorClosing_ = true;
+        if (meteorStartTimer_) meteorStartTimer_->stop();
+        if (meteorStopTimer_) meteorStopTimer_->stop();
+        for (auto *process : {meteorPassProcess_, meteorDecodeProcess_}) {
+            if (process && process->state() != QProcess::NotRunning) {
+                process->kill();
+                process->waitForFinished(1000);
+            }
+        }
         if (settingsTimer_ && settingsTimer_->isActive()) {
             settingsTimer_->stop();
             saveReceiverSettings();
@@ -892,6 +1245,8 @@ public:
         voice_ = nullptr;
         delete aprs_;
         aprs_ = nullptr;
+        delete sonde_;
+        sonde_ = nullptr;
         delete morse_;
         morse_ = nullptr;
         if (audio_) {
@@ -1011,6 +1366,550 @@ public:
         clear->click();
         return morseText_->toPlainText().isEmpty();
     }
+    bool spectrumUiTest() {
+        if (!pages_->widget(5)->isAncestorOf(digitalMode_) ||
+            !pages_->widget(5)->isAncestorOf(digitalTable_) ||
+            !pages_->widget(0)->isAncestorOf(spectrum_)) return false;
+        pages_->setCurrentIndex(0);
+        spectrum_->resize(1001, 200);
+        spectrum_->setFrame(QVector<float>(kBlock, -80), 7124000, 7100000);
+        QMouseEvent click(QEvent::MouseButtonRelease, QPointF(500, 60), Qt::LeftButton,
+                          Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(spectrum_, &click);
+        if (std::llround(frequency_->value() * 1000000) != 7124000) return false;
+        spectrum_->setFrame(QVector<float>(kBlock, -80), 7124000, 7124000);
+        QMouseEvent left(QEvent::MouseButtonRelease, QPointF(0, 150), Qt::LeftButton,
+                         Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(spectrum_, &left);
+        if (std::llround(frequency_->value() * 1000000) != 7024000) return false;
+        QApplication::sendEvent(spectrum_, &click);
+        if (std::llround(frequency_->value() * 1000000) != 7024000) return false;
+        QVector<float> demo(kBlock);
+        for (int line = 0; line < 80; ++line) {
+            for (int i = 0; i < kBlock; ++i) {
+                const double a = (i - 975) / 4.0, b = (i - 1200) / 8.0;
+                demo[i] = float(-110 + 3 * std::sin(i * 0.17 + line) +
+                                65 * std::exp(-a * a) + 52 * std::exp(-b * b));
+            }
+            spectrum_->setFrame(demo, 7048000, 7024000);
+        }
+        return true;
+    }
+    bool digitalTabUiTest() {
+        pages_->setCurrentIndex(5);
+        digitalMode_->setCurrentIndex(digitalMode_->findData(int(DigitalMode::FT8)));
+        return pages_->currentIndex() == 5 && pages_->widget(5)->isAncestorOf(digitalMode_) &&
+            pages_->widget(5)->isAncestorOf(digitalTable_);
+    }
+    bool meteorUiTest() const {
+        return pages_->tabText(7) == "Meteor-M" &&
+            pages_->widget(7)->isAncestorOf(meteorPassChoice_) &&
+            pages_->widget(7)->isAncestorOf(meteorFrequency_) &&
+            pages_->widget(7)->isAncestorOf(meteorRate_) &&
+            pages_->widget(7)->isAncestorOf(meteorRecommendation_) &&
+            pages_->widget(7)->isAncestorOf(meteorListenTest_) &&
+            pages_->widget(7)->isAncestorOf(meteorImage_) &&
+            meteorFrequency_->count() >= 2 && meteorRate_->count() == 2 &&
+            meteorFrequency_->itemData(0).toLongLong() == 137100000 &&
+            meteorFrequency_->itemData(1).toLongLong() == 137900000 &&
+            meteorRate_->itemData(0).toString() == "meteor_m2-x_lrpt" &&
+            meteorRate_->itemData(1).toString() == "meteor_m2-x_lrpt_80k";
+    }
+    void refreshMeteorPasses() {
+        if (meteorPassProcess_->state() != QProcess::NotRunning) return;
+        const auto location = maidenheadLocation(savedQth_);
+        if (!location) {
+            meteorStatus_->setText("Zapisz poprawny lokator Maidenhead w zakładce Ustawienia SDR, aby obliczyć przeloty.");
+            return;
+        }
+        const QString script = QDir(QCoreApplication::applicationDirPath()).filePath("meteor_passes.py");
+        if (!QFileInfo::exists(script)) {
+            meteorStatus_->setText("Brak meteor_passes.py obok programu. Zbuduj aplikację ponownie.");
+            return;
+        }
+        meteorPassChoice_->clear();
+        meteorPasses_.clear();
+        meteorFrequencyObservations_.clear();
+        meteorRecommendedFrequencyHz_ = 0;
+        meteorRecommendationRecent_ = false;
+        meteorRecommendation_->setText("Pobieranie ostatnich odbiorów częstotliwości...");
+        meteorUseRecommendation_->setEnabled(false);
+        meteorRefresh_->setEnabled(false);
+        meteorStatus_->setText("Pobieranie elementów orbitalnych i ostatnich odbiorów społecznościowych...");
+        meteorPassProcess_->setProgram("python3");
+        meteorPassProcess_->setArguments({
+            script, "--predict",
+            QString::number(location->latitude, 'f', 8),
+            QString::number(location->longitude, 'f', 8),
+        });
+        meteorPassProcess_->start();
+    }
+    void meteorPassRequestFinished(int exitCode, QProcess::ExitStatus exitStatus) {
+        meteorRefresh_->setEnabled(!meteorRecording_ && !meteorArmed_);
+        const QByteArray output = meteorPassProcess_->readAllStandardOutput();
+        const QString errorText = QString::fromUtf8(meteorPassProcess_->readAllStandardError()).trimmed();
+        if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+            meteorStatus_->setText("Nie udało się obliczyć przelotów. " +
+                (errorText.isEmpty() ? "Sprawdź połączenie internetowe i pakiet python3-sgp4." :
+                 errorText.left(400)));
+            return;
+        }
+        QJsonParseError parseError;
+        const auto document = QJsonDocument::fromJson(output, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+            meteorStatus_->setText("Nieprawidłowa odpowiedź prognozy przelotów: " +
+                                   parseError.errorString());
+            return;
+        }
+        for (const auto &value : document.object().value("passes").toArray()) {
+            const auto object = value.toObject();
+            MeteorPass pass;
+            pass.satellite = object.value("satellite").toString();
+            pass.start = QDateTime::fromString(object.value("start_utc").toString(), Qt::ISODate);
+            pass.maximum = QDateTime::fromString(object.value("maximum_utc").toString(), Qt::ISODate);
+            pass.end = QDateTime::fromString(object.value("end_utc").toString(), Qt::ISODate);
+            pass.maximumElevation = object.value("maximum_elevation").toDouble(-1);
+            if (pass.satellite.isEmpty() || !pass.start.isValid() || !pass.maximum.isValid() ||
+                !pass.end.isValid() || pass.start >= pass.end ||
+                !std::isfinite(pass.maximumElevation) || pass.maximumElevation < 0 ||
+                pass.maximumElevation > 90) continue;
+            meteorPasses_.append(pass);
+            meteorPassChoice_->addItem(QString("%1 — %2, max %3°")
+                .arg(pass.start.toLocalTime().toString("ddd HH:mm"))
+                .arg(pass.satellite)
+                .arg(pass.maximumElevation, 0, 'f', 1));
+        }
+        while (meteorFrequency_->count() > 2) meteorFrequency_->removeItem(2);
+        meteorFrequencyObservations_.clear();
+        meteorFrequencyError_ = document.object().value("frequency_error").toString();
+        for (const auto &value : document.object().value("frequency_observations").toArray()) {
+            const auto object = value.toObject();
+            const QString satellite = object.value("satellite").toString();
+            const qint64 frequencyHz = object.value("frequency_hz").toVariant().toLongLong();
+            if (satellite.isEmpty() || frequencyHz < 137000000 || frequencyHz > 138000000)
+                continue;
+            MeteorFrequencyObservation observation;
+            observation.frequencyHz = frequencyHz;
+            observation.ageSeconds = object.value("age_seconds").toInt(-1);
+            observation.station = object.value("station").toString();
+            meteorFrequencyObservations_.insert(satellite, observation);
+            if (meteorFrequency_->findData(frequencyHz) < 0) {
+                const double mhz = frequencyHz / 1000000.0;
+                const int decimals = frequencyHz % 1000000 == 0 ? 1 : 4;
+                meteorFrequency_->addItem(QString::number(mhz, 'f', decimals) + " MHz", frequencyHz);
+            }
+        }
+        if (meteorPasses_.isEmpty()) {
+            meteorStatus_->setText("Brak przelotów Meteor-M powyżej 10° w ciągu następnych 24 godzin.");
+        } else {
+            meteorPassChoice_->setCurrentIndex(0);
+            meteorStatus_->setText(QString("Znaleziono %1 przelotów. Czasy lokalne; elementy orbitalne z CelesTrak.")
+                .arg(meteorPasses_.size()));
+        }
+        updateMeteorRecommendation();
+    }
+    void updateMeteorRecommendation() {
+        meteorRecommendedFrequencyHz_ = 0;
+        meteorRecommendationRecent_ = false;
+        meteorUseRecommendation_->setEnabled(false);
+        const int index = meteorPassChoice_->currentIndex();
+        if (index < 0 || index >= meteorPasses_.size()) {
+            meteorRecommendation_->setText(meteorFrequencyError_.isEmpty()
+                ? "Brak wybranego przelotu do dopasowania ostatniego odbioru."
+                : "Dane o częstotliwości niedostępne: " + meteorFrequencyError_);
+            return;
+        }
+        const auto observation = meteorFrequencyObservations_.constFind(meteorPasses_[index].satellite);
+        if (observation == meteorFrequencyObservations_.constEnd()) {
+            meteorRecommendation_->setText(meteorFrequencyError_.isEmpty()
+                ? "Brak ostatniego odbioru SatNOGS dla tej sondy; wybierz częstotliwość ręcznie."
+                : "Dane o częstotliwości niedostępne: " + meteorFrequencyError_);
+            return;
+        }
+        meteorRecommendedFrequencyHz_ = observation->frequencyHz;
+        const bool recent = observation->ageSeconds >= 0 && observation->ageSeconds <= 24 * 60 * 60;
+        meteorRecommendationRecent_ = recent;
+        QString ageText = "czas nieznany";
+        if (observation->ageSeconds >= 0) {
+            const qint64 hours = observation->ageSeconds / 3600;
+            const qint64 days = hours / 24;
+            ageText = days > 0 ? QString("%1 d temu").arg(days) :
+                hours > 0 ? QString("%1 h temu").arg(hours) :
+                QString("%1 min temu").arg(std::max<qint64>(1, observation->ageSeconds / 60));
+        }
+        const QString station = observation->station.isEmpty()
+            ? QString() : QString(" — %1").arg(observation->station);
+        meteorRecommendation_->setText(
+            QString("%1: ostatni odbiór %2 MHz, %3%4. Dane społecznościowe; "
+                    "zacznij od 72 ksym/s, a przy braku synchronizacji spróbuj 80 ksym/s.%5")
+                .arg(meteorPasses_[index].satellite)
+                .arg(observation->frequencyHz / 1000000.0, 0, 'f',
+                     observation->frequencyHz % 1000000 == 0 ? 1 : 4)
+                .arg(ageText.isEmpty() ? "czas nieznany" : ageText)
+                .arg(station)
+                .arg(recent ? "" : " Odczyt jest starszy niż 24 h."));
+        meteorUseRecommendation_->setEnabled(recent);
+    }
+    void toggleMeteorListenTest() {
+        if (meteorPreviewing_) {
+            stopMeteorListenTest();
+            return;
+        }
+        if (meteorArmed_ || meteorRecording_ || adsb_ || scanning_ ||
+            !receiver_ || !receiver_->isRunning()) {
+            meteorStatus_->setText("Zatrzymaj inne zadania odbiornika przed testem odsłuchu.");
+            return;
+        }
+        if (!audio_) {
+            meteorStatus_->setText("Wyjście audio nie jest dostępne; nie można wykonać testu odsłuchu.");
+            return;
+        }
+        meteorPreviewRestoreFrequency_ = frequency_->value();
+        meteorPreviewRestoreModeIndex_ = digitalEnabled_ ? previousMode_ : mode_->currentIndex();
+        meteorPreviewRestoreDigitalIndex_ = digitalMode_->currentIndex();
+        meteorPreviewRestoreMuted_ = mute_->isChecked();
+        meteorPreviewRestoreSquelch_ = squelch_->isChecked();
+        meteorPreviewing_ = true;
+        digitalMode_->setCurrentIndex(0);
+        frequency_->setValue(meteorFrequency_->currentData().toDouble() / 1000000.0);
+        mode_->setCurrentIndex(mode_->findData(int(Mode::WFM)));
+        mute_->setChecked(false);
+        squelch_->setChecked(false);
+        meteorListenTest_->setText("Zakończ test");
+        setMeteorBusyUi(true);
+        applySettings();
+        if (volume_->value() == 0) {
+            meteorStatus_->setText("Test: głośność ustawiona na 0%; zwiększ ją w zakładce Odbiornik.");
+        } else {
+            meteorStatus_->setText(
+                QString("Test: %1 MHz WFM; oczekiwanie na próbki. Synchronizacja LRPT niepotwierdzona.")
+                    .arg(frequency_->value(), 0, 'f', 4));
+        }
+    }
+    void stopMeteorListenTest() {
+        if (!meteorPreviewing_) return;
+        meteorPreviewing_ = false;
+        digitalMode_->setCurrentIndex(0);
+        mode_->setCurrentIndex(meteorPreviewRestoreModeIndex_);
+        frequency_->setValue(meteorPreviewRestoreFrequency_);
+        if (meteorPreviewRestoreDigitalIndex_ > 0)
+            digitalMode_->setCurrentIndex(meteorPreviewRestoreDigitalIndex_);
+        if (!mute_->isChecked()) mute_->setChecked(meteorPreviewRestoreMuted_);
+        squelch_->setChecked(meteorPreviewRestoreSquelch_);
+        meteorListenTest_->setText("Test odsłuchu");
+        setMeteorBusyUi(false);
+        applySettings();
+        meteorStatus_->setText("Test zakończony; przywrócono poprzednie ustawienia odbiornika.");
+    }
+    void toggleMeteorRecording() {
+        if (meteorArmed_) {
+            meteorStartTimer_->stop();
+            meteorArmed_ = false;
+            setMeteorBusyUi(false);
+            meteorStatus_->setText("Anulowano oczekiwanie na przelot.");
+            return;
+        }
+        if (meteorRecording_) {
+            stopMeteorRecording();
+            return;
+        }
+        if (meteorPreviewing_) stopMeteorListenTest();
+        if (meteorDecodeProcess_->state() != QProcess::NotRunning) return;
+        if (adsb_ || scanning_ || !receiver_ || !receiver_->isRunning()) {
+            meteorStatus_->setText("Zatrzymaj ADS-B lub skanowanie; odbiornik SDR musi być uruchomiony.");
+            return;
+        }
+        const int index = meteorPassChoice_->currentIndex();
+        if (index < 0 || index >= meteorPasses_.size()) {
+            meteorStatus_->setText("Odśwież prognozę i wybierz przelot.");
+            return;
+        }
+        meteorScheduledPass_ = meteorPasses_[index];
+        const auto now = QDateTime::currentDateTimeUtc();
+        if (meteorScheduledPass_.end <= now) {
+            meteorStatus_->setText("Wybrany przelot już się zakończył. Odśwież prognozę.");
+            return;
+        }
+        meteorRestoreFrequency_ = frequency_->value();
+        meteorRestoreModeIndex_ = digitalEnabled_ ? previousMode_ : mode_->currentIndex();
+        meteorRestoreDigitalIndex_ = digitalMode_->currentIndex();
+        if (meteorScheduledPass_.start > now) {
+            meteorArmed_ = true;
+            setMeteorBusyUi(true);
+            meteorStartTimer_->start(int(std::min<qint64>(
+                now.msecsTo(meteorScheduledPass_.start), std::numeric_limits<int>::max())));
+            meteorStatus_->setText(QString("Oczekiwanie na %1. Nagrywanie rozpocznie się o %2 lokalnie.")
+                .arg(meteorScheduledPass_.satellite)
+                .arg(meteorScheduledPass_.start.toLocalTime().toString("HH:mm:ss")));
+            return;
+        }
+        startMeteorRecording(meteorScheduledPass_);
+    }
+    void startMeteorRecording(const MeteorPass &pass) {
+        meteorArmed_ = false;
+        if (pass.end <= QDateTime::currentDateTimeUtc().addSecs(1)) {
+            setMeteorBusyUi(false);
+            meteorStatus_->setText("Wybrany przelot zakończył się przed rozpoczęciem nagrania. Odśwież prognozę.");
+            return;
+        }
+        if (adsb_ || scanning_ || !receiver_ || !receiver_->isRunning()) {
+            setMeteorBusyUi(false);
+            meteorStatus_->setText("Nie można rozpocząć nagrania: odbiornik SDR jest zajęty lub zatrzymany.");
+            return;
+        }
+        const QString directory = QDir(QStandardPaths::writableLocation(
+            QStandardPaths::AppDataLocation)).filePath("meteor-m");
+        if (!QDir().mkpath(directory)) {
+            setMeteorBusyUi(false);
+            meteorStatus_->setText("Nie można utworzyć katalogu nagrań Meteor-M.");
+            return;
+        }
+        QStorageInfo storage(directory);
+        storage.refresh();
+        constexpr qint64 requiredBytes = 1200000000;
+        if (storage.isValid() && storage.bytesAvailable() < requiredBytes) {
+            setMeteorBusyUi(false);
+            meteorStatus_->setText("Za mało wolnego miejsca. Nagranie może zająć do 1,11 GB.");
+            return;
+        }
+        const QString stamp = QDateTime::currentDateTimeUtc().toString("yyyyMMdd_HHmmss_zzz");
+        meteorCapturePath_ = QDir(directory).filePath("MeteorM_" + stamp + ".cs16");
+        meteorPipeline_ = meteorRate_->currentData().toString();
+        meteorScheduledPass_ = pass;
+        frequency_->setValue(meteorFrequency_->currentData().toDouble() / 1000000.0);
+        digitalMode_->setCurrentIndex(0);
+        mode_->setCurrentIndex(mode_->findData(int(Mode::WFM)));
+        meteorRecording_ = true;
+        if (audio_) audio_->setVolume(0);
+        setMeteorBusyUi(true);
+        applySettings();
+        meteorStatus_->setText("Otwieranie pliku IQ dla " + pass.satellite + "...");
+    }
+    void stopMeteorRecording() {
+        if (!meteorRecording_) return;
+        meteorStopTimer_->stop();
+        meteorRecording_ = false;
+        applySettings();
+        meteorStatus_->setText("Zamykanie pliku IQ Meteor-M...");
+    }
+    void setMeteorBusyUi(bool busy) {
+        meteorRecord_->setText(meteorArmed_ ? "Anuluj przelot" :
+                               meteorRecording_ ? "Zatrzymaj nagrywanie" :
+                               "Nagraj wybrany przelot");
+        meteorRecord_->setEnabled(true);
+        meteorPassChoice_->setEnabled(!busy);
+        meteorFrequency_->setEnabled(!busy);
+        meteorRate_->setEnabled(!busy);
+        meteorUseRecommendation_->setEnabled(!busy && meteorRecommendationRecent_);
+        meteorRefresh_->setEnabled(!busy && meteorPassProcess_->state() == QProcess::NotRunning);
+        meteorListenTest_->setEnabled(!busy || meteorPreviewing_);
+        meteorListenTest_->setText(meteorPreviewing_ ? "Zakończ test" : "Test odsłuchu");
+        frequency_->setEnabled(!busy && !scanning_ && !digitalEnabled_);
+        mode_->setEnabled(!busy && !scanning_ && !digitalEnabled_);
+        digitalMode_->setEnabled(!busy && !scanning_);
+        scanButton_->setEnabled(!busy && !scanning_ && !digitalEnabled_ &&
+                                receiver_ && receiver_->isRunning());
+        adsbStart_->setEnabled(!busy && !adsb_);
+        mainList_->setEnabled(!busy);
+        stationChoice_->setEnabled(!busy && stationChoice_->count() > 0);
+        previousStation_->setEnabled(!busy && stationChoice_->count() > 0);
+        nextStation_->setEnabled(!busy && stationChoice_->count() > 0);
+        updateSquelchControls();
+    }
+    void restoreMeteorReceiverSettings() {
+        digitalMode_->setCurrentIndex(0);
+        mode_->setCurrentIndex(meteorRestoreModeIndex_);
+        frequency_->setValue(meteorRestoreFrequency_);
+        if (meteorRestoreDigitalIndex_ > 0)
+            digitalMode_->setCurrentIndex(meteorRestoreDigitalIndex_);
+        applySettings();
+    }
+    void decodeMeteorRecording(const QString &path) {
+        const QFileInfo input(path);
+        if (!input.exists() || input.size() < 1024) {
+            meteorStatus_->setText("Nagranie IQ jest puste lub niekompletne; pomijam dekodowanie.");
+            return;
+        }
+        if (meteorDecodeProcess_->state() != QProcess::NotRunning) {
+            meteorStatus_->setText("SatDump już dekoduje inne nagranie.");
+            return;
+        }
+        const QString output = input.absolutePath() + "/" + input.completeBaseName() + "_decoded";
+        if (!QDir().mkpath(output)) {
+            meteorStatus_->setText("Nie można utworzyć katalogu wynikowego SatDump.");
+            return;
+        }
+        meteorImage_->clear();
+        meteorImage_->setText("SatDump dekoduje nagranie LRPT...");
+        meteorRecord_->setEnabled(false);
+        meteorRefresh_->setEnabled(false);
+        meteorDecodeProcess_->setProgram("satdump");
+        meteorDecodeProcess_->setArguments({
+            meteorPipeline_, "baseband", input.absoluteFilePath(), output,
+            "--samplerate", "384000", "--baseband_format", "cs16",
+        });
+        meteorDecodeProcess_->start();
+    }
+    void meteorDecodeFinished(int exitCode, QProcess::ExitStatus exitStatus) {
+        meteorRecord_->setEnabled(true);
+        meteorRefresh_->setEnabled(!meteorRecording_ && !meteorArmed_);
+        const QString errors = QString::fromUtf8(meteorDecodeProcess_->readAllStandardError()).trimmed();
+        meteorDecodeProcess_->readAllStandardOutput();
+        if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+            meteorStatus_->setText("SatDump nie zdekodował nagrania." +
+                (errors.isEmpty() ? QString() : " " + errors.left(400)));
+            meteorImage_->setText("Brak obrazu — sprawdź sygnał LRPT i częstotliwość.");
+            return;
+        }
+        const QString output = QFileInfo(meteorCapturePath_).absolutePath() + "/" +
+            QFileInfo(meteorCapturePath_).completeBaseName() + "_decoded";
+        QString imagePath;
+        qint64 largestImage = 0;
+        QDirIterator iterator(output, {"*.png", "*.jpg", "*.jpeg", "*.bmp"},
+                              QDir::Files, QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            const QString candidate = iterator.next();
+            const qint64 size = iterator.fileInfo().size();
+            if (size > largestImage) {
+                largestImage = size;
+                imagePath = candidate;
+            }
+        }
+        if (imagePath.isEmpty()) {
+            meteorStatus_->setText("SatDump zakończył pracę, ale nie utworzył obrazu. Nagranie zachowano: " +
+                                   meteorCapturePath_);
+            meteorImage_->setText("Brak obrazu w wynikach SatDump.");
+            return;
+        }
+        QImageReader reader(imagePath);
+        const QImage image = reader.read();
+        if (image.isNull()) {
+            meteorStatus_->setText("Nie można wczytać obrazu SatDump: " + reader.errorString());
+            return;
+        }
+        meteorImage_->setPixmap(QPixmap::fromImage(image).scaled(
+            meteorImage_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        meteorStatus_->setText("Zdekodowano obraz Meteor-M. Nagranie i produkty zapisano w " +
+                               QFileInfo(imagePath).absolutePath());
+    }
+    bool sondeUiTest() {
+        pages_->setCurrentIndex(6);
+        auto *refresh = findChild<QPushButton *>("refreshSondes");
+        auto *stop = findChild<QPushButton *>("stopSonde");
+        auto *decode = findChild<QPushButton *>("receiveSonde");
+        auto *zoomIn = sondeMap_->findChild<QPushButton *>("mapZoomIn");
+        auto *zoomOut = sondeMap_->findChild<QPushButton *>("mapZoomOut");
+        auto *fit = sondeMap_->findChild<QPushButton *>("mapFit");
+        if (!refresh || !stop || !decode || !zoomIn || !zoomOut || !fit ||
+            !pages_->widget(6)->isAncestorOf(sondeTable_)) return false;
+        refresh->click();
+        if (!sondeStatus_->text().contains("pozycję")) return false;
+        adsbQth_ = Location{52, 21};
+        receiveSondeTelemetry(R"({"id":"MANUAL","lat":52.5,"lon":21.5,"frame":1})");
+        if (sondeFrames_->text() != "Lokalne ramki: 1" || !sondeMap_->localPosition() ||
+            sondeMap_->zoomLevel() < 0) return false;
+        const auto now = QDateTime::currentDateTimeUtc();
+        showSondes({{"A", "RS41", 403000000, {53, 21}, 12000, 111, now},
+                    {"B", "M10", 402000000, {52, 22}, 10000, 68, now}});
+        sondeTable_->selectRow(1);
+        emit sondeTable_->cellClicked(1, 0);
+        if (settings().frequency != 402000000 || settings().mode != Mode::NFM ||
+            selectedSondeSerial_ != "B") return false;
+        decode->click();
+        if (!sondeSelected() || sondeType() != SondeType::M10 ||
+            settings().mode != Mode::DigitalVoice || decoderKey(digitalMode_->currentIndex()) != "M10") return false;
+        receiveSondeTelemetry(R"({"id":"M10-OTHER","lat":52,"lon":21})");
+        if (sondeFrames_->text() != "Lokalne ramki: 0" || sondeMap_->localPosition()) return false;
+        receiveSondeTelemetry(R"({"id":"M10-B","lat":52.5,"lon":22.5,"alt":12000,"frame":12})");
+        receiveSondeTelemetry(R"({"id":"M10-B","lat":92,"lon":22.5,"frame":13})");
+        if (sondeFrames_->text() != "Lokalne ramki: 2" || !sondeMap_->localPosition() ||
+            sondeMap_->localPosition()->latitude != 52.5 ||
+            sondeTelemetryFields_[1]->text() != "Ramka: 13" ||
+            sondeTelemetryFields_[4]->text() != "Szerokość: 52.50000" ||
+            sondeTelemetryFields_[5]->text() != "Długość: 22.50000" ||
+            sondeTelemetryFields_[6]->text() != "Wysokość: —" ||
+            sondeTelemetryFields_[3]->text() == "Pozycja UTC: —")
+            return false;
+        stop->click();
+        if (sondeSelected() || settings().mode != Mode::NFM) return false;
+        sondeTable_->selectRow(0);
+        emit sondeTable_->cellClicked(0, 0);
+        if (settings().frequency != 403000000 || selectedSondeSerial_ != "A" ||
+            sondeMap_->localPosition() || sondeFrames_->text() != "Lokalne ramki: 0") return false;
+        const int initialZoom = sondeMap_->zoomLevel();
+        zoomIn->click();
+        if (sondeMap_->zoomLevel() != initialZoom + 1) return false;
+        const QPointF center = sondeMap_->viewCenter();
+        QMouseEvent press(QEvent::MouseButtonPress, QPointF(100, 100), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent move(QEvent::MouseMove, QPointF(130, 120), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent release(QEvent::MouseButtonRelease, QPointF(130, 120), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(sondeMap_, &press);
+        QApplication::sendEvent(sondeMap_, &move);
+        QApplication::sendEvent(sondeMap_, &release);
+        if (sondeMap_->viewCenter() == center) return false;
+        const QPointF movedCenter = sondeMap_->viewCenter();
+        showSondes({{"A", "RS41", 403100000, {53.1, 21}, 12000, 120, now},
+                    {"B", "M10", 402000000, {52, 22}, 10000, 68, now}});
+        if (settings().frequency != 403000000 || sondeTable_->currentRow() != 0 ||
+            sondeMap_->viewCenter() != movedCenter || sondeMap_->zoomLevel() != initialZoom + 1) return false;
+        zoomOut->click();
+        if (sondeMap_->zoomLevel() != initialZoom) return false;
+        fit->click();
+        if (sondeMap_->viewCenter() == movedCenter) return false;
+        sondeTable_->selectRow(1);
+        emit sondeTable_->cellClicked(1, 0);
+        if (sondeFrames_->text() != "Lokalne ramki: 2" || !sondeMap_->localPosition()) return false;
+        showSondes({});
+        if (!sondeMap_->localPosition() || sondeMap_->zoomLevel() < 0) return false;
+        showSondes({{"A", "RS41", 403100000, {53.1, 21}, 12000, 120, now}});
+        sondeTable_->selectRow(0);
+        emit sondeTable_->cellClicked(0, 0);
+        digitalMode_->setCurrentIndex(digitalMode_->findData(sondeRs41));
+        if (!sondeSelected() || settings().mode != Mode::DigitalVoice ||
+            mode_->currentData().toInt() != int(Mode::NFM)) return false;
+        receiveSondeTelemetry(R"({"id":"A","lat":53.1,"lon":21.0,"alt":12000,"frame":42,"temp":-25.5,"humidity":32.5,"batt":2.8})");
+        if (sondeTelemetryFields_[0]->text() != "Sonda: A" ||
+            sondeTelemetryFields_[6]->text() != "Wysokość: 12000 m" ||
+            sondeTelemetryFields_[10]->text() != "Temperatura: -25.5 °C" ||
+            sondeTelemetryFields_[11]->text() != "Wilgotność: 32.5 %" ||
+            sondeTelemetryFields_[12]->text() != "Ciśnienie: —" ||
+            sondeTelemetryFields_[14]->text() != "Bateria: 2.8 V") return false;
+        sondeLaunch_->setText("Start wg SondeHub: stacja testowa");
+        stop->click();
+        if (sondeSelected() || settings().mode == Mode::DigitalVoice ||
+            sondeFrames_->text() != "Lokalne ramki: 1" || !sondeMap_->localPosition()) return false;
+        showSondes({{"609-2-02055", "M20", 403000000, {52, 21}, 12000, 0, now}});
+        sondeTable_->selectRow(0);
+        emit sondeTable_->cellClicked(0, 0);
+        decode->click();
+        if (!sondeSelected() || sondeType() != SondeType::M20 || !settings().sondeIq ||
+            decoderKey(digitalMode_->currentIndex()) != "M20") return false;
+        receiveSondeTelemetry(R"({"type":"M10","id":"M10-609-2-02055","lat":52,"lon":21})");
+        if (sondeFrames_->text() != "Lokalne ramki: 0" || !sondeStatus_->text().contains("M10")) return false;
+        receiveSondeTelemetry(R"({"type":"M20","id":"M20-609-2-02055","lat":52,"lon":21,"alt":12000,"frame":42})");
+        if (sondeFrames_->text() != "Lokalne ramki: 1" || !sondeMap_->localPosition() ||
+            sondeTelemetryFields_[0]->text() != "Sonda: 609-2-02055") return false;
+        stop->click();
+        return !sondeSelected() && settings().mode == Mode::NFM;
+    }
+    void startSondeNetworkTest() {
+        adsbQth_ = Location{52, 21};
+        pages_->setCurrentIndex(6);
+        refreshSondeList();
+    }
+    bool sondeNetworkTestDone() const { return !sondeReply_; }
+    bool sondeNetworkTestSucceeded() const { return sondeStatus_->text().startsWith("SondeHub:"); }
+    void startSondeLaunchNetworkTest(const QString &serial) {
+        selectedSondeSerial_ = serial;
+        requestLaunchSite(serial);
+    }
+    bool sondeLaunchNetworkTestDone() const { return !sitesReply_ && !launchReply_; }
+    bool sondeLaunchNetworkTestSucceeded() const {
+        return launchDone_ && launchError_.isEmpty() && sitesError_.isEmpty() &&
+               sitesLoaded_ && launchSites_.contains(launchSiteId_);
+    }
+    QString sondeLaunchNetworkTestStatus() const { return sondeLaunch_->text(); }
+    bool spectrumSmokeSucceeded() const { return receivedIq_ && spectrumFrames_ >= 10; }
     void startCwSmoke() {
         morseInputBlocks_ = 0;
         frequency_->setValue(7.025);
@@ -1341,6 +2240,228 @@ public:
     }
 
 private:
+    void showLocalSonde() {
+        const auto it = localSondes_.constFind(localDisplaySerial_.toUpper());
+        const bool available = it != localSondes_.constEnd();
+        sondeFrames_->setText(QString("Lokalne ramki: %1").arg(available ? it->frames : 0));
+        const QJsonObject data = available ? it->data : QJsonObject{};
+        auto value = [&data](const char *key, int precision, const QString &unit) {
+            const auto v = data.value(QLatin1String(key));
+            return v.isDouble() ? QString::number(v.toDouble(), 'f', precision) + unit : QString("—");
+        };
+        const auto position = available ? it->position : std::optional<Location>{};
+        const QStringList values = {
+            "Sonda: " + (available ? localDisplaySerial_ : QString("—")),
+            "Ramka: " + value("frame", 0, ""),
+            "Odbiór UTC: " + (available ? it->received.toUTC().toString("HH:mm:ss") : QString("—")),
+            "Pozycja UTC: " + (position ? it->positionReceived.toUTC().toString("HH:mm:ss") : QString("—")),
+            "Szerokość: " + (position ? QString::number(position->latitude, 'f', 5) : QString("—")),
+            "Długość: " + (position ? QString::number(position->longitude, 'f', 5) : QString("—")),
+            "Wysokość: " + value("alt", 0, " m"),
+            "Odległość: " + (position && adsbQth_ ? QString::number(distanceKm(*adsbQth_, *position), 'f', 1) + " km" : QString("—")),
+            "Prędkość: " + value("vel_h", 1, " m/s"),
+            "Wznoszenie: " + value("vel_v", 1, " m/s"),
+            "Temperatura: " + value("temp", 1, " °C"),
+            "Wilgotność: " + value("humidity", 1, " %"),
+            "Ciśnienie: " + value("pressure", 1, " hPa"),
+            "Kierunek: " + value("heading", 0, "°"),
+            "Bateria: " + value("batt", 1, " V"),
+            "Satelity: " + value("sats", 0, "")
+        };
+        for (int i = 0; i < values.size(); ++i) sondeTelemetryFields_[i]->setText(values[i]);
+        sondeMap_->setLocalPosition(position);
+    }
+
+    void receiveSondeTelemetry(const QString &text) {
+        try {
+            const auto telemetry = parseSondeTelemetry(text);
+            const QString receivedType = telemetry.data.value("type").toString();
+            if (sondeSelected() && !receivedType.isEmpty() &&
+                receivedType.compare(decoderKey(digitalMode_->currentIndex()), Qt::CaseInsensitive) != 0) {
+                sondeStatus_->setText("Odebrano sondę typu " + receivedType +
+                                      "; wybrano " + decoderKey(digitalMode_->currentIndex()) + ".");
+                return;
+            }
+            if (!selectedSondeSerial_.isEmpty() &&
+                telemetry.serial != selectedSondeSerial_.toUpper()) {
+                sondeStatus_->setText("Odebrano inną sondę: " + telemetry.serial +
+                                      "; nie przypisano ramki do wybranej sondy.");
+                return;
+            }
+            if (selectedSondeSerial_.isEmpty()) {
+                localDisplaySerial_ = telemetry.serial;
+                sondeMap_->setPositions(adsbQth_, {});
+            }
+            auto &local = localSondes_[telemetry.serial];
+            ++local.frames;
+            local.data = telemetry.data;
+            local.received = QDateTime::currentDateTimeUtc();
+            if (telemetry.position) {
+                local.position = telemetry.position;
+                local.positionReceived = local.received;
+            }
+            showLocalSonde();
+            sondeStatus_->setText("Odebrano lokalnie sondę " + telemetry.serial + ".");
+        } catch (const std::runtime_error &error) {
+            sondeStatus_->setText("Błąd telemetrii sondy: " + QString::fromUtf8(error.what()));
+        }
+    }
+
+    using SondeJsonCallback = std::function<void(const QJsonObject &, const QString &)>;
+    QNetworkReply *requestSondeJson(const QUrl &url, SondeJsonCallback callback) {
+        QNetworkRequest request(url);
+        request.setRawHeader("User-Agent", "SDRTouch/1.0 (+https://github.com/stachurp/sdr-touch)");
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        auto *reply = sondeNetwork_->get(request);
+        auto response = std::make_shared<QByteArray>();
+        auto tooLarge = std::make_shared<bool>(false);
+        QTimer::singleShot(20000, reply, &QNetworkReply::abort);
+        connect(reply, &QNetworkReply::readyRead, this, [reply, response, tooLarge] {
+            *response += reply->readAll();
+            if (response->size() > 8 * 1024 * 1024) { *tooLarge = true; reply->abort(); }
+        });
+        connect(reply, &QNetworkReply::finished, this, [reply, response, tooLarge, callback] {
+            *response += reply->readAll();
+            QString error;
+            QJsonObject object;
+            if (*tooLarge || response->size() > 8 * 1024 * 1024)
+                error = "odpowiedź przekracza 8 MiB";
+            else if (reply->error() != QNetworkReply::NoError)
+                error = reply->errorString();
+            else {
+                QJsonParseError parseError;
+                const auto doc = QJsonDocument::fromJson(*response, &parseError);
+                if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+                    error = "nieprawidłowa odpowiedź SondeHub";
+                else object = doc.object();
+            }
+            reply->deleteLater();
+            callback(object, error);
+        });
+        return reply;
+    }
+
+    void updateLaunchSite() {
+        if (!launchError_.isEmpty()) sondeLaunch_->setText("Start: błąd SondeHub: " + launchError_);
+        else if (!launchDone_) sondeLaunch_->setText("Start: pobieranie danych SondeHub...");
+        else if (launchSiteId_.isEmpty() || launchSiteId_.startsWith('-'))
+            sondeLaunch_->setText("Start: brak informacji w SondeHub.");
+        else if (!sitesError_.isEmpty()) sondeLaunch_->setText("Start: błąd listy stacji: " + sitesError_);
+        else if (!sitesLoaded_) sondeLaunch_->setText("Start: pobieranie listy stacji...");
+        else sondeLaunch_->setText("Start wg SondeHub: " +
+            launchSites_.value(launchSiteId_, "nieznana stacja " + launchSiteId_));
+        sondeLaunch_->setToolTip(sondeLaunch_->text());
+    }
+
+    void requestLaunchSite(const QString &serial) {
+        ++launchGeneration_;
+        const int generation = launchGeneration_;
+        if (launchReply_) {
+            auto *previous = launchReply_;
+            launchReply_ = nullptr;
+            previous->abort();
+        }
+        launchDone_ = false;
+        launchSiteId_.clear();
+        launchError_.clear();
+        updateLaunchSite();
+        if (!sitesLoaded_ && !sitesReply_) {
+            sitesError_.clear();
+            sitesReply_ = requestSondeJson(QUrl("https://api.v2.sondehub.org/sites"),
+                [this](const QJsonObject &data, const QString &error) {
+                    sitesReply_ = nullptr;
+                    sitesError_ = error;
+                    if (error.isEmpty()) {
+                        for (auto it = data.constBegin(); it != data.constEnd(); ++it) {
+                            const auto name = it.value().toObject().value("station_name").toString();
+                            if (!name.isEmpty()) launchSites_.insert(it.key(), name);
+                        }
+                        if (launchSites_.isEmpty()) sitesError_ = "brak stacji w odpowiedzi";
+                        else sitesLoaded_ = true;
+                    }
+                    if (!selectedSondeSerial_.isEmpty()) updateLaunchSite();
+                });
+        }
+        QUrl url("https://api.v2.sondehub.org/sondes/summary");
+        QUrlQuery query;
+        query.addQueryItem("serial", serial);
+        query.addQueryItem("predictions_only", "false");
+        url.setQuery(query);
+        launchReply_ = requestSondeJson(url, [this, serial, generation](const QJsonObject &data, const QString &error) {
+            if (generation != launchGeneration_ || serial != selectedSondeSerial_) return;
+            launchReply_ = nullptr;
+            launchDone_ = true;
+            launchError_ = error;
+            if (error.isEmpty()) {
+                if (!data.value("radiosondes").isObject()) {
+                    launchError_ = "nieprawidłowa odpowiedź o miejscu startu";
+                } else {
+                    const auto site = data.value("radiosondes").toObject().value(serial).toObject()
+                                          .value("launchsite");
+                    if (site.isString()) launchSiteId_ = site.toString();
+                    else if (site.isDouble()) launchSiteId_ = QString::number(site.toInt());
+                }
+            }
+            updateLaunchSite();
+        });
+    }
+
+    void selectSonde(int row, bool test = false) {
+        if (meteorArmed_ || meteorRecording_ || meteorPreviewing_) {
+            sondeStatus_->setText("Odbiornik jest zajęty testem lub nagrywaniem Meteor-M.");
+            return;
+        }
+        if (row < 0 || row >= sondeCandidates_.size()) return;
+        const auto &candidate = sondeCandidates_[row];
+        const bool changed = selectedSondeSerial_ != candidate.serial;
+        selectedSondeSerial_ = candidate.serial;
+        localDisplaySerial_ = candidate.serial;
+        if (changed) sondeMap_->setLocalPosition({});
+        sondeMap_->setPositions(adsbQth_, candidate.position, changed);
+        if (changed) {
+            showLocalSonde();
+        }
+        if (!test && (changed || !launchError_.isEmpty() || !sitesError_.isEmpty()))
+            requestLaunchSite(candidate.serial);
+        if (adsb_ || scanning_ || (!test && (!receiver_ || !receiver_->isRunning()))) {
+            sondeStatus_->setText("Odbiornik jest niedostępny lub skanowanie trwa; pokazano pozycję sondy.");
+            return;
+        }
+        digitalMode_->setCurrentIndex(0);
+        mode_->setCurrentIndex(mode_->findData(int(Mode::NFM)));
+        frequency_->setValue(candidate.frequencyHz / 1000000.0);
+        sondeStatus_->setText(QString("Odsłuch %1: %2 MHz, %3 km. Pozycja z SondeHub: %4 UTC.")
+                              .arg(candidate.serial).arg(candidate.frequencyHz / 1000000.0, 0, 'f', 6)
+                              .arg(candidate.distance, 0, 'f', 1)
+                              .arg(candidate.received.toUTC().toString("dd.MM HH:mm:ss")));
+    }
+
+    void showSondes(const QVector<SondeCandidate> &candidates) {
+        sondeCandidates_ = candidates;
+        const QSignalBlocker blocker(sondeTable_);
+        sondeTable_->setRowCount(0);
+        int selected = -1;
+        for (const auto &candidate : sondeCandidates_) {
+            const int row = sondeTable_->rowCount();
+            sondeTable_->insertRow(row);
+            sondeTable_->setItem(row, 0, new QTableWidgetItem(candidate.serial));
+            sondeTable_->setItem(row, 1, new QTableWidgetItem(candidate.type));
+            auto *frequency = new QTableWidgetItem(QString::number(candidate.frequencyHz / 1000000.0, 'f', 6));
+            frequency->setData(Qt::UserRole, candidate.frequencyHz);
+            sondeTable_->setItem(row, 2, frequency);
+            sondeTable_->setItem(row, 3, new QTableWidgetItem(QString::number(candidate.distance, 'f', 0)));
+            sondeTable_->setItem(row, 4, new QTableWidgetItem(QString::number(candidate.altitude, 'f', 0)));
+            sondeTable_->setItem(row, 5, new QTableWidgetItem(candidate.received.toUTC().toString("HH:mm:ss")));
+            if (candidate.serial == selectedSondeSerial_) selected = row;
+        }
+        if (selected >= 0) {
+            sondeTable_->selectRow(selected);
+            sondeMap_->setPositions(adsbQth_, sondeCandidates_[selected].position);
+        } else {
+            sondeMap_->setPositions(adsbQth_, {});
+        }
+    }
+
     void setupAdsbPosition(bool test) {
         if (!test) {
             QSettings settings;
@@ -1390,6 +2511,17 @@ private:
                 return;
             }
             adsbQth_ = location;
+            selectedSondeSerial_.clear();
+            localDisplaySerial_.clear();
+            ++launchGeneration_;
+            if (launchReply_) {
+                auto *previous = launchReply_;
+                launchReply_ = nullptr;
+                previous->abort();
+            }
+            sondeLaunch_->setText("Start: wybierz sondę.");
+            showLocalSonde();
+            showSondes({});
             adsbStatus_->setText(location ? "Zapisano pozycję ADS-B lokalnie." : "Usunięto pozycję ADS-B.");
         });
         aircraftTable_->horizontalHeader()->setSortIndicatorShown(true);
@@ -1408,6 +2540,59 @@ private:
     void sortAircraft() {
         aircraftTable_->horizontalHeader()->setSortIndicator(aircraftSortColumn_, aircraftSortOrder_);
         aircraftTable_->sortItems(aircraftSortColumn_, aircraftSortOrder_);
+    }
+
+    void refreshSondeList() {
+        if (!adsbQth_) {
+            showSondes({});
+            sondeStatus_->setText("Najpierw zapisz pozycję w zakładce Samoloty ADS-B.");
+            return;
+        }
+        if (sondeReply_) {
+            sondeStatus_->setText("Pobieranie listy sond już trwa.");
+            return;
+        }
+        sondeStatus_->setText("Pobieranie listy SondeHub...");
+        sondeResponse_.clear();
+        QNetworkRequest request(QUrl("https://api.v2.sondehub.org/sondes?last=1800"));
+        request.setRawHeader("User-Agent", "SDR-Touch");
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        sondeReply_ = sondeNetwork_->get(request);
+        auto *reply = sondeReply_;
+        auto *timer = new QTimer(reply);
+        timer->setSingleShot(true);
+        connect(timer, &QTimer::timeout, reply, &QNetworkReply::abort);
+        timer->start(20000);
+        connect(reply, &QNetworkReply::readyRead, this, [this, reply] {
+            sondeResponse_ += reply->readAll();
+            if (sondeResponse_.size() > 8 * 1024 * 1024) reply->abort();
+        });
+        connect(reply, &QNetworkReply::finished, this, [this, reply] {
+            sondeReply_ = nullptr;
+            if (reply->error() != QNetworkReply::NoError) {
+                showSondes({});
+                sondeStatus_->setText("Błąd pobierania SondeHub: " + reply->errorString());
+                sondeResponse_.clear();
+                reply->deleteLater();
+                return;
+            }
+            sondeResponse_ += reply->readAll();
+            try {
+                if (sondeResponse_.size() > 8 * 1024 * 1024)
+                    throw std::runtime_error("Odpowiedź SondeHub przekracza 8 MiB");
+                if (!adsbQth_) throw std::runtime_error("Brak zapisanej pozycji ADS-B");
+                const auto candidates = parseSondeCandidates(sondeResponse_, *adsbQth_, 500,
+                                                              QDateTime::currentDateTimeUtc());
+                showSondes(candidates);
+                sondeStatus_->setText(QString("SondeHub: %1 sond w promieniu 500 km; zasięg nie jest gwarantowany.")
+                                      .arg(candidates.size()));
+            } catch (const std::exception &error) {
+                showSondes({});
+                sondeStatus_->setText("Błąd listy sond: " + QString::fromUtf8(error.what()));
+            }
+            sondeResponse_.clear();
+            reply->deleteLater();
+        });
     }
 
     void showAircraft(const QVector<Aircraft> &aircraft) {
@@ -1437,6 +2622,10 @@ private:
     }
 
     void toggleAdsb() {
+        if (meteorArmed_ || meteorRecording_ || meteorPreviewing_) {
+            adsbStatus_->setText("Zakończ test lub nagranie Meteor-M przed uruchomieniem ADS-B.");
+            return;
+        }
         if (adsb_) {
             if (stopAdsb()) adsbStatus_->setText("ADS-B wyłączony. Uruchamianie odbiornika.");
             return;
@@ -1480,6 +2669,7 @@ private:
         savedDigitalMode_ = digitalMode_->currentIndex();
         if (savedDigitalMode_ != 0) digitalMode_->setCurrentIndex(0);
         receiver_->stop();
+        spectrum_->clear("Widmo niedostępne podczas ADS-B");
         if (audio_) audio_->setVolume(0);
         frequency_->setEnabled(false);
         mode_->setEnabled(false);
@@ -1704,7 +2894,7 @@ private:
         const auto &station = lists_->lists()[mainList_->currentIndex()].stations[index];
         const int modeIndex = mode_->findText(station.mode == "WFM" ? "WFM mono" : station.mode);
         if (digitalEnabled_ && station.mode !=
-            (voiceMode() == VoiceMode::Off && !aprsSelected() ? "USB" : "NFM"))
+            (voiceMode() == VoiceMode::Off && !aprsSelected() && !sondeSelected() ? "USB" : "NFM"))
             digitalMode_->setCurrentIndex(0);
         if (!digitalEnabled_) mode_->setCurrentIndex(modeIndex);
         frequency_->setValue(station.frequencyHz / 1000000.0);
@@ -1717,7 +2907,8 @@ private:
         if (scanning_)
             s.mode = static_cast<Mode>(scanMode_->currentData().toInt());
         else if (digitalMode_->currentData().toInt() != int(DigitalMode::Off))
-            s.mode = voiceMode() == VoiceMode::Off && !aprsSelected() ? Mode::DigitalUSB : Mode::DigitalVoice;
+            s.mode = voiceMode() == VoiceMode::Off && !aprsSelected() && !sondeSelected() ?
+                Mode::DigitalUSB : Mode::DigitalVoice;
         s.scan = scanning_;
         s.scanStart = std::llround(start_->value() * 1000000);
         s.scanEnd = std::llround(end_->value() * 1000000);
@@ -1725,6 +2916,9 @@ private:
         s.threshold = threshold_->value();
         s.squelchEnabled = squelch_->isChecked();
         s.squelchThresholdDbfs = squelchThreshold_->value();
+        s.sondeIq = !scanning_ && !adsb_ && sondeSelected() && sondeType() != SondeType::M10;
+        s.meteorIq = meteorRecording_;
+        s.meteorCapturePath = meteorRecording_ ? meteorCapturePath_ : QString();
         s.scanId = scanId_;
         s.frontend = frontendSettings_;
         return s;
@@ -1752,11 +2946,28 @@ private:
 
     void applySettings() {
         const auto s = settings();
+        if (receiver_) receiver_->setSpectrumEnabled(pages_->currentIndex() == 0 && !scanning_ && !adsb_);
+        if (scanning_) spectrum_->clear("Widmo niedostępne podczas skanowania");
         const VoiceMode voice = scanning_ ? VoiceMode::Off : voiceMode();
-        if (digital_) digital_->configure(!scanning_ && voice == VoiceMode::Off && !aprsSelected() ?
+        if (digital_) digital_->configure(!scanning_ && voice == VoiceMode::Off && !aprsSelected() && !sondeSelected() ?
                                            DigitalMode(digitalMode_->currentData().toInt()) : DigitalMode::Off,
                                            s.frequency);
         if (aprs_) aprs_->configure(!scanning_ && !adsb_ && aprsSelected(), s.frequency);
+        if (sonde_) {
+            const bool enabled = !scanning_ && !adsb_ && sondeSelected();
+            if (!enabled && sonde_->isActive()) {
+                sonde_->stop();
+                sondeStatus_->setText("Dekodowanie sondy zatrzymane.");
+            }
+            else if (enabled && sonde_->isActive() &&
+                     (sonde_->frequency() != s.frequency || sonde_->type() != sondeType())) {
+                sonde_->stop();
+            }
+            if (enabled && !sonde_->isActive()) {
+                sondeStatus_->setText("Sonda: oczekiwanie na sygnał z odbiornika.");
+                if (sondeType() == SondeType::M10) sonde_->start(s.frequency, sondeType());
+            }
+        }
         if (morse_) {
             const bool active = !scanning_ && !adsb_ && s.mode == Mode::CW;
             morse_->configure(active, s.frequency);
@@ -1783,6 +2994,14 @@ private:
     }
 
     bool aprsSelected() const { return digitalMode_->currentData().toInt() == aprs1200; }
+    bool sondeSelected() const {
+        const int mode = digitalMode_->currentData().toInt();
+        return mode == sondeRs41 || mode == sondeM10 || mode == sondeM20;
+    }
+    SondeType sondeType() const {
+        const int mode = digitalMode_->currentData().toInt();
+        return mode == sondeM10 ? SondeType::M10 : mode == sondeM20 ? SondeType::M20 : SondeType::RS41;
+    }
 
     QString decoderKey(int index) const {
         const QVariant data = digitalMode_->itemData(index);
@@ -1792,6 +3011,9 @@ private:
         if (value == voiceDmr) return "DMR";
         if (value == voiceYsf) return "YSF";
         if (value == aprs1200) return "APRS";
+        if (value == sondeRs41) return "RS41";
+        if (value == sondeM10) return "M10";
+        if (value == sondeM20) return "M20";
         if (value == int(DigitalMode::FT8)) return "FT8";
         if (value == int(DigitalMode::FT4)) return "FT4";
         if (value == int(DigitalMode::WSPR)) return "WSPR";
@@ -2093,7 +3315,8 @@ private:
     }
 
     void updateSquelchControls() {
-        const bool available = !scanning_ && !adsb_ &&
+        const bool available = !scanning_ && !adsb_ && !meteorArmed_ &&
+            !meteorRecording_ && !meteorPreviewing_ &&
             digitalMode_->currentData().toInt() == int(DigitalMode::Off);
         squelch_->setEnabled(available);
     }
@@ -2114,6 +3337,10 @@ private:
     }
 
     void toggleScan() {
+        if (meteorArmed_ || meteorRecording_ || meteorPreviewing_) {
+            meteorStatus_->setText("Zakończ test lub nagranie Meteor-M przed skanowaniem.");
+            return;
+        }
         if (scanning_) {
             scanning_ = false;
             setScanUi(false);
@@ -2160,6 +3387,53 @@ private:
     QTableWidget *table_, *listTable_;
     QTableWidget *aircraftTable_;
     QTableWidget *digitalTable_;
+    QTableWidget *sondeTable_;
+    SondeMap *sondeMap_;
+    QVector<SondeCandidate> sondeCandidates_;
+    QString selectedSondeSerial_;
+    QString localDisplaySerial_;
+    QVector<QLabel *> sondeTelemetryFields_;
+    QLabel *sondeLaunch_, *sondeFrames_;
+    QHash<QString, LocalSondeReception> localSondes_;
+    QHash<QString, QString> launchSites_;
+    QNetworkReply *sitesReply_ = nullptr;
+    QNetworkReply *launchReply_ = nullptr;
+    QString launchSiteId_, launchError_, sitesError_;
+    bool sitesLoaded_ = false, launchDone_ = false;
+    int launchGeneration_ = 0;
+    QLabel *sondeStatus_;
+    QNetworkAccessManager *sondeNetwork_;
+    QNetworkReply *sondeReply_ = nullptr;
+    QByteArray sondeResponse_;
+    QComboBox *meteorPassChoice_, *meteorFrequency_, *meteorRate_;
+    QPushButton *meteorRefresh_, *meteorRecord_, *meteorListenTest_;
+    QPushButton *meteorUseRecommendation_;
+    QLabel *meteorStatus_, *meteorImage_, *meteorRecommendation_;
+    QProcess *meteorPassProcess_ = nullptr;
+    QProcess *meteorDecodeProcess_ = nullptr;
+    QTimer *meteorStartTimer_ = nullptr;
+    QTimer *meteorStopTimer_ = nullptr;
+    QVector<MeteorPass> meteorPasses_;
+    QHash<QString, MeteorFrequencyObservation> meteorFrequencyObservations_;
+    MeteorPass meteorScheduledPass_;
+    QString meteorFrequencyError_;
+    QString meteorCapturePath_;
+    QString meteorPipeline_;
+    qint64 meteorRecommendedFrequencyHz_ = 0;
+    double meteorPreviewRestoreFrequency_ = 7.1;
+    int meteorPreviewRestoreModeIndex_ = 0;
+    int meteorPreviewRestoreDigitalIndex_ = 0;
+    bool meteorPreviewRestoreSquelch_ = false;
+    double meteorRestoreFrequency_ = 7.1;
+    int meteorRestoreModeIndex_ = 0;
+    int meteorRestoreDigitalIndex_ = 0;
+    bool meteorArmed_ = false;
+    bool meteorRecording_ = false;
+    bool meteorPreviewing_ = false;
+    bool meteorPreviewRestoreMuted_ = false;
+    bool meteorClosing_ = false;
+    bool meteorRecommendationRecent_ = false;
+    SpectrumWidget *spectrum_;
     QTabWidget *pages_;
     QComboBox *digitalMode_;
     QLineEdit *qth_;
@@ -2171,6 +3445,7 @@ private:
     DigitalDecoder *digital_ = nullptr;
     VoiceDecoder *voice_ = nullptr;
     AprsDecoder *aprs_ = nullptr;
+    SondeDecoder *sonde_ = nullptr;
     MorseDecoder *morse_ = nullptr;
     QPlainTextEdit *morseText_;
     QLabel *morseStatus_;
@@ -2210,6 +3485,7 @@ private:
     int voiceInputBlocks_ = 0;
     int aprsInputBlocks_ = 0;
     int morseInputBlocks_ = 0;
+    int spectrumFrames_ = 0;
 };
 
 int receiverSettingsTest() {
@@ -2737,6 +4013,72 @@ int main(int argc, char **argv) {
     QCoreApplication::setOrganizationName("SDRTouch");
     QCoreApplication::setApplicationName("SDRTouch");
     const QStringList args = app.arguments();
+    if (args.contains("--sonde-launch-network-test")) {
+        const int index = args.indexOf("--sonde-launch-network-test");
+        if (index + 1 >= args.size()) {
+            std::cerr << "Provide a SondeHub serial number\n";
+            return 1;
+        }
+        Window window(true);
+        window.startSondeLaunchNetworkTest(args.at(index + 1));
+        QTimer timer;
+        QObject::connect(&timer, &QTimer::timeout, &app, [&] {
+            if (!window.sondeLaunchNetworkTestDone()) return;
+            if (!window.sondeLaunchNetworkTestSucceeded()) {
+                std::cerr << "Launch site test failed: " << window.sondeLaunchNetworkTestStatus().toStdString() << '\n';
+                app.exit(1);
+            } else {
+                std::cout << "SondeHub launch site lookup passed\n";
+                app.exit(0);
+            }
+        });
+        timer.start(100);
+        QTimer::singleShot(25000, &app, [&] { std::cerr << "Launch site test timed out\n"; app.exit(1); });
+        return app.exec();
+    }
+    if (args.contains("--sonde-map-test")) {
+        SondeMap map(true);
+        map.resize(500, 300);
+        map.show();
+        map.setPositions(Location{52, 21}, Location{53, 20});
+        QTimer timer;
+        int stage = 0;
+        QObject::connect(&timer, &QTimer::timeout, &app, [&] {
+            if (!map.loaded()) return;
+            if (stage == 0) {
+                ++stage;
+                map.zoomBy(1);
+                return;
+            }
+            if (stage == 1) {
+                ++stage;
+                QMouseEvent press(QEvent::MouseButtonPress, QPointF(100, 100),
+                                  Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                QMouseEvent move(QEvent::MouseMove, QPointF(180, 130),
+                                 Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+                QMouseEvent release(QEvent::MouseButtonRelease, QPointF(180, 130),
+                                    Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                QApplication::sendEvent(&map, &press);
+                QApplication::sendEvent(&map, &move);
+                QApplication::sendEvent(&map, &release);
+                return;
+            }
+            const auto screenshot = qEnvironmentVariable("SDR_TOUCH_SCREENSHOT");
+            if (!screenshot.isEmpty() && !map.grab().save(screenshot)) {
+                std::cerr << "Could not save map screenshot\n";
+                app.exit(1);
+            } else {
+                std::cout << "OpenStreetMap tiles loaded\n";
+                app.exit(0);
+            }
+        });
+        timer.start(100);
+        QTimer::singleShot(25000, &app, [&] {
+            std::cerr << "Map tile test failed: " << map.error().toStdString() << '\n';
+            app.exit(1);
+        });
+        return app.exec();
+    }
     if (args.contains("--settings-test")) return receiverSettingsTest();
     if (args.contains("--settings-hardware-test")) {
         QTemporaryDir directory;
@@ -2967,18 +4309,68 @@ int main(int argc, char **argv) {
         });
         return app.exec();
     }
+    if (args.contains("--spectrum-smoke-test")) {
+        Window window(false, true);
+        window.show();
+        QTimer::singleShot(6000, &app, [&] {
+            if (!window.spectrumSmokeSucceeded()) {
+                std::cerr << "Live IQ-to-spectrum test failed\n";
+                app.exit(1);
+            } else {
+                std::cout << "Live RSP1 IQ reached the spectrum display\n";
+                app.exit(0);
+            }
+        });
+        return app.exec();
+    }
+    if (args.contains("--sonde-network-test")) {
+        Window window(true);
+        window.show();
+        window.startSondeNetworkTest();
+        QTimer timer;
+        QObject::connect(&timer, &QTimer::timeout, &app, [&] {
+            if (!window.sondeNetworkTestDone()) return;
+            if (!window.sondeNetworkTestSucceeded()) {
+                std::cerr << "SondeHub network test failed\n";
+                app.exit(1);
+            } else {
+                std::cout << "SondeHub request and local filtering passed\n";
+                app.exit(0);
+            }
+        });
+        timer.start(100);
+        QTimer::singleShot(25000, &app, [&] { std::cerr << "SondeHub test timed out\n"; app.exit(1); });
+        return app.exec();
+    }
     if (args.contains("--ui-test") || args.contains("--voice-ui-test") || args.contains("--ui-scan-test") || args.contains("--sort-test") ||
         args.contains("--scan-step-test") ||
         args.contains("--frontend-ui-test") || args.contains("--squelch-aprs-ui-test") || args.contains("--cw-ui-test") ||
-        args.contains("--adsb-ui-test")) {
+        args.contains("--spectrum-ui-test") || args.contains("--digital-tab-ui-test") || args.contains("--sonde-ui-test") ||
+        args.contains("--adsb-ui-test") || args.contains("--meteor-ui-test")) {
         std::unique_ptr<QTemporaryDir> testSettings;
-        if (args.contains("--adsb-ui-test")) {
+        if (args.contains("--adsb-ui-test") || args.contains("--sonde-ui-test")) {
             testSettings = std::make_unique<QTemporaryDir>();
             if (!testSettings->isValid()) return 1;
             QSettings::setDefaultFormat(QSettings::IniFormat);
             QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, testSettings->path());
         }
         Window window(true);
+        if (args.contains("--sonde-ui-test") && !window.sondeUiTest()) {
+            std::cerr << "Sonde tab UI test failed\n";
+            return 1;
+        }
+        if (args.contains("--digital-tab-ui-test") && !window.digitalTabUiTest()) {
+            std::cerr << "Digital decoder tab UI test failed\n";
+            return 1;
+        }
+        if (args.contains("--meteor-ui-test") && !window.meteorUiTest()) {
+            std::cerr << "Meteor-M tab UI test failed\n";
+            return 1;
+        }
+        if (args.contains("--spectrum-ui-test") && !window.spectrumUiTest()) {
+            std::cerr << "Spectrum or digital tab UI test failed\n";
+            return 1;
+        }
         if (args.contains("--cw-ui-test") && !window.cwUiTest()) {
             std::cerr << "CW UI history test failed\n";
             return 1;

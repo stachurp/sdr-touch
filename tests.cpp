@@ -21,6 +21,24 @@ int main() {
         std::cerr << "FFT amplitude or bandwidth test failed\n";
         return 1;
     }
+    {
+        SpectrumAnalyzer spectrum;
+        auto bins = spectrum.process(tone);
+        const auto strongest = std::max_element(bins.begin(), bins.end());
+        const int expectedBin = kBlock / 2 + 1875 * kBlock / kSampleRate;
+        if (int(bins.size()) != kBlock || strongest - bins.begin() != expectedBin ||
+            std::abs(*strongest - 20 * std::log10(0.25)) > 0.1) {
+            std::cerr << "Spectrum FFT frequency or amplitude failed\n";
+            return 1;
+        }
+        for (auto &sample : tone) sample = std::conj(sample);
+        bins = spectrum.process(tone);
+        if (std::max_element(bins.begin(), bins.end()) - bins.begin() !=
+            kBlock / 2 - 1875 * kBlock / kSampleRate) {
+            std::cerr << "Spectrum FFT negative frequency failed\n";
+            return 1;
+        }
+    }
     std::mt19937 rng(12345);
     std::normal_distribution<float> noise(0, 0.02f);
     for (int count : {8, 9}) {
